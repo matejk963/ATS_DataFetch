@@ -1,0 +1,28 @@
+name: ATS_DataFetch
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scipy
+  - jupyter
+  - jupyterlab
+  - notebook
+  - ipykernel
+  - pytest
+  - requests
+  - beautifulsoup4
+  - lxml
+  - pymysql
+  - psycopg2
+  - pip:
+    - black
+    - flake8
+    - mypy
+    - pre-commit
