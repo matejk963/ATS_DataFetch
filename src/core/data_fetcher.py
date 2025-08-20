@@ -24,6 +24,103 @@ except ImportError as e:
     TPDATA_AVAILABLE = False
 
 
+class BidAskValidator:
+    """
+    Validator for filtering negative bid-ask spreads.
+    
+    Prevents financially impossible data where ask price < bid price from 
+    entering the system.
+    """
+    
+    def __init__(self, strict_mode: bool = True, log_filtered: bool = True):
+        """
+        Initialize validator.
+        
+        Args:
+            strict_mode: If True, remove invalid records. If False, mark them.
+            log_filtered: If True, log details of filtered records.
+        """
+        self.strict_mode = strict_mode
+        self.log_filtered = log_filtered
+        self.filtered_count = 0
+        self.total_processed = 0
+    
+    def validate_merged_data(self, df: pd.DataFrame, source_name: str = "DataFetcher") -> pd.DataFrame:
+        """
+        Validate bid-ask spreads in merged data (trades + orders format).
+        
+        Args:
+            df: DataFrame with 'b_price' and 'a_price' columns
+            source_name: Name of data source for logging
+            
+        Returns:
+            Validated DataFrame (filtered or marked invalid records)
+        """
+        if df.empty:
+            return df
+        
+        # Only validate if both bid and ask columns exist and have data
+        if 'b_price' not in df.columns or 'a_price' not in df.columns:
+            if self.log_filtered:
+                print(f"   ⚠️  No bid/ask columns in {source_name} data - skipping validation")
+            return df
+        
+        # Count records with both bid and ask data
+        has_both_prices = df['b_price'].notna() & df['a_price'].notna()
+        valid_records = df[has_both_prices]
+        
+        if valid_records.empty:
+            if self.log_filtered:
+                print(f"   ⚠️  No records with both bid/ask in {source_name} - skipping validation")
+            return df
+        
+        # Identify negative spreads (ask < bid)
+        negative_mask = valid_records['a_price'] < valid_records['b_price']
+        negative_count = negative_mask.sum()
+        
+        self.total_processed += len(valid_records)
+        self.filtered_count += negative_count
+        
+        if negative_count > 0:
+            if self.log_filtered:
+                worst_spread = (valid_records.loc[negative_mask, 'a_price'] - 
+                               valid_records.loc[negative_mask, 'b_price']).min()
+                print(f"   🚫 {source_name}: Found {negative_count} negative spreads "
+                      f"({negative_count/len(valid_records)*100:.1f}%) - worst: {worst_spread:.3f}")
+                
+                # Sample of problematic records  
+                sample_records = valid_records[negative_mask].head(3)
+                for idx, row in sample_records.iterrows():
+                    spread_val = row['a_price'] - row['b_price']
+                    print(f"      🔍 {idx}: bid={row['b_price']:.3f}, ask={row['a_price']:.3f}, "
+                          f"spread={spread_val:.3f}")
+            
+            if self.strict_mode:
+                # Remove records with negative spreads
+                invalid_indices = valid_records[negative_mask].index
+                df_filtered = df.drop(invalid_indices)
+                print(f"      ✅ {source_name}: Removed {negative_count} invalid records "
+                      f"({len(df)} → {len(df_filtered)})")
+                return df_filtered
+            else:
+                # Mark invalid records
+                df.loc[valid_records[negative_mask].index, 'is_valid'] = False
+                print(f"      ⚠️  {source_name}: Marked {negative_count} records as invalid")
+        else:
+            if self.log_filtered:
+                print(f"      ✅ {source_name}: All {len(valid_records)} records have valid spreads")
+        
+        return df
+    
+    def get_stats(self) -> Dict:
+        """Get validation statistics."""
+        return {
+            'total_processed': self.total_processed,
+            'filtered_count': self.filtered_count,
+            'filter_rate': self.filtered_count / max(1, self.total_processed) * 100
+        }
+
+
 class DeliveryDateCalculator:
     """Calculate first delivery dates from tenor/contract specifications"""
     
@@ -141,8 +238,16 @@ class ContractValidator:
             if field not in contract_config:
                 raise ValueError(f"Missing required field: {field}")
         
-        # Check market is valid
-        valid_markets = ['de', 'fr', 'hu', 'it', 'es', 'ttf', 'the', 'eua']
+        # Check market is valid (including cross-market combinations)
+        base_markets = ['de', 'fr', 'hu', 'it', 'es', 'ttf', 'the', 'eua']
+        valid_markets = base_markets.copy()
+        
+        # Add cross-market combinations for spreads (market1_market2 format)
+        for market1 in base_markets:
+            for market2 in base_markets:
+                if market1 != market2:
+                    valid_markets.append(f"{market1}_{market2}")
+        
         if contract_config['market'] not in valid_markets:
             raise ValueError(f"Invalid market: {contract_config['market']}")
         
@@ -289,9 +394,73 @@ class DataFetcher:
         
         return result
     
+    def fetch_spread_contract_data(self, contract1_config: Dict, contract2_config: Dict,
+                                 include_trades: bool = True, 
+                                 include_orders: bool = True) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch data for a spread contract using two delivery dates
+        
+        Args:
+            contract1_config: First contract configuration
+            contract2_config: Second contract configuration  
+            include_trades: Whether to fetch trade data
+            include_orders: Whether to fetch order book data
+            
+        Returns:
+            Dictionary containing spread contract data
+        """
+        self._init_connections()
+        
+        # Resolve dates for both contracts
+        start_date1, end_date1 = self._resolve_contract_dates(contract1_config)
+        start_date2, end_date2 = self._resolve_contract_dates(contract2_config)
+        
+        # Use overlapping date range
+        start_date = max(start_date1, start_date2)
+        end_date = min(end_date1, end_date2)
+        
+        # Extract contract parameters (using first contract as primary)
+        market = contract1_config['market']
+        tenor = contract1_config['tenor']
+        venue_list = contract1_config.get('venue_list', ['eex'])
+        prod = contract1_config.get('prod', 'base')
+        
+        # Calculate product delivery dates
+        product_date1 = DeliveryDateCalculator.calc_delivery_date(
+            contract1_config['tenor'], contract1_config['contract']
+        )
+        product_date2 = DeliveryDateCalculator.calc_delivery_date(
+            contract2_config['tenor'], contract2_config['contract']
+        )
+        
+        # Trading hours
+        start_time = time(self.trading_hours[0], 0, 0)
+        end_time = time(self.trading_hours[1], 0, 0)
+        
+        result = {}
+        
+        # Generate business days in the range
+        dates = pd.date_range(start_date, end_date, freq='B')
+        
+        if include_trades:
+            result['spread_trades'] = self._fetch_trades(
+                market, tenor, venue_list, product_date1, 
+                dates, start_time, end_time, prod, product_date2
+            )
+        
+        if include_orders:
+            result['spread_orders'] = self._fetch_orders(
+                market, tenor, venue_list, product_date1,
+                dates, start_time, end_time, prod, product_date2
+            )
+            result['spread_mid_prices'] = self._calculate_mid_prices(result['spread_orders'])
+        
+        return result
+    
     def _fetch_trades(self, market: str, tenor: str, venue_list: List[str], 
                      product_date: datetime, dates: pd.DatetimeIndex,
-                     start_time: time, end_time: time, prod: str) -> pd.DataFrame:
+                     start_time: time, end_time: time, prod: str, 
+                     product_date2: Optional[datetime] = None) -> pd.DataFrame:
         """Fetch trade data following legacy pattern"""
         df_tr = pd.DataFrame([])
         
@@ -305,10 +474,25 @@ class DataFetcher:
             eT = datetime.combine(ds[-1], end_time)
             
             # Trades
-            df_tr_aux = self.data_class_oracle.get_trades(market, tenor, venue_list, p_d, bT, eT, prod)
+            try:
+                if '_' in market:
+                    # Cross-market spread: same delivery date, different markets (identified by market="de_fr")
+                    df_tr_aux = self.data_class_oracle.get_trades(market, tenor, venue_list, p_d, bT, eT, prod)
+                elif product_date2 is not None:
+                    # Spread contract: different delivery dates
+                    df_tr_aux = self.data_class_oracle.get_trades(market, tenor, venue_list, p_d, bT, eT, prod, product_date2)
+                else:
+                    # Single contract: original behavior
+                    df_tr_aux = self.data_class_oracle.get_trades(market, tenor, venue_list, p_d, bT, eT, prod)
+            except AttributeError as e:
+                if "microsecond" in str(e):
+                    print(f"⚠️  Pandas index microsecond compatibility issue, returning empty trades")
+                    df_tr_aux = pd.DataFrame()
+                else:
+                    raise e
             
             # Filter by broker
-            if self.allowed_broker_ids and tenor != 'da':
+            if self.allowed_broker_ids and tenor != 'da' and not df_tr_aux.empty:
                 df_tr_aux = df_tr_aux[df_tr_aux['broker_id'].isin(self.allowed_broker_ids)]
             
             try:
@@ -316,20 +500,22 @@ class DataFetcher:
             except(TypeError):
                 pass
             
-            # Group trades
-            df_tr_aux['count'] = 1
-            df_tr_aux['price'] *= df_tr_aux['volume']
-            df_tr_aux = df_tr_aux.groupby(df_tr_aux.index).agg(agg_dict)
-            df_tr_aux['price'] /= df_tr_aux['volume']
-            
-            df_tr = pd.concat([df_tr, df_tr_aux])
+            # Group trades (only if not empty)
+            if not df_tr_aux.empty:
+                df_tr_aux['count'] = 1
+                df_tr_aux['price'] *= df_tr_aux['volume']
+                df_tr_aux = df_tr_aux.groupby(df_tr_aux.index).agg(agg_dict)
+                df_tr_aux['price'] /= df_tr_aux['volume']
+                
+                df_tr = pd.concat([df_tr, df_tr_aux])
             del df_tr_aux
         
         return df_tr
     
     def _fetch_orders(self, market: str, tenor: str, venue_list: List[str],
                      product_date: datetime, dates: pd.DatetimeIndex,
-                     start_time: time, end_time: time, prod: str) -> pd.DataFrame:
+                     start_time: time, end_time: time, prod: str,
+                     product_date2: Optional[datetime] = None) -> pd.DataFrame:
         """Fetch order book data following legacy pattern"""
         df_ba = pd.DataFrame([])
         
@@ -340,15 +526,33 @@ class DataFetcher:
             eT = datetime.combine(ds[-1], end_time)
             
             # Order book data
-            df_ba_aux = self.data_class_pg.get_best_ob_data(market, tenor, venue_list, p_d, bT, eT, prod, None, False)
-            df_ba_aux = df_ba_aux.rename(columns={'bidbestprice': 'b_price', 'askbestprice': 'a_price'})
-            
             try:
-                df_ba_aux = df_ba_aux.between_time(start_time, end_time)
-            except(TypeError):
-                pass
-            
-            df_ba = pd.concat([df_ba, df_ba_aux])
+                if '_' in market:
+                    # Cross-market spread: same delivery date, different markets (identified by market="de_fr")
+                    df_ba_aux = self.data_class_pg.get_best_ob_data(market, tenor, venue_list, p_d, bT, eT, prod, None, False)
+                
+                elif product_date2 is not None:
+                    # Spread contract: different delivery dates
+                    df_ba_aux = self.data_class_pg.get_best_ob_data(market, tenor, venue_list, p_d, bT, eT, prod, product_date2, False)
+                
+                else:
+                    # Single contract: original behavior  
+                    df_ba_aux = self.data_class_pg.get_best_ob_data(market, tenor, venue_list, p_d, bT, eT, prod, None, False)
+            except AttributeError as e:
+                if "microsecond" in str(e):
+                    print(f"⚠️  Pandas index microsecond compatibility issue, returning empty orders")
+                    df_ba_aux = pd.DataFrame()
+                else:
+                    raise e
+            if not df_ba_aux.empty:
+                df_ba_aux = df_ba_aux.rename(columns={'bidbestprice': 'b_price', 'askbestprice': 'a_price'})
+                
+                try:
+                    df_ba_aux = df_ba_aux.between_time(start_time, end_time)
+                except(TypeError):
+                    pass
+                
+                df_ba = pd.concat([df_ba, df_ba_aux])
             del df_ba_aux
         
         return df_ba
@@ -417,10 +621,21 @@ class DataFetcher:
                 merged_data = pd.concat([merged_data, data['mid_prices']], axis=1, join='outer')
             
             if not merged_data.empty:
+                # Validate bid-ask spreads before saving
+                print(f"   🔍 Validating bid-ask spreads for {contract_key}...")
+                validator = BidAskValidator(strict_mode=True, log_filtered=True)
+                validated_data = validator.validate_merged_data(merged_data, contract_key)
+                
+                # Log validation summary
+                stats = validator.get_stats()
+                if stats['total_processed'] > 0:
+                    print(f"      📊 Validation summary: {stats['filtered_count']}/{stats['total_processed']} "
+                          f"negative spreads filtered ({stats['filter_rate']:.1f}%)")
+                
                 file_path = os.path.join(output_dir, f'{contract_key}_tr_ba_data.parquet')
                 
                 # Reset index to avoid datetime index metadata issues
-                simple_data = merged_data.reset_index()
+                simple_data = validated_data.reset_index()
                 
                 # Save with minimal options to prevent corruption
                 simple_data.to_parquet(file_path, index=False)
@@ -498,25 +713,68 @@ class DataFetcher:
         markets = [c['market'] for c in contracts]
         tenors = [c['tenor'] for c in contracts]
         
-        # Extract contract numbers for SpreadViewer
-        tn1_list = []
-        tn2_list = []
-        
-        for contract in contracts:
-            contract_spec = contract['contract']
-            if contract['tenor'] == 'm':  # Monthly
-                month_num = int(contract_spec.split('_')[0])
-                tn1_list.append(month_num)
-            elif contract['tenor'] == 'q':  # Quarterly
-                quarter_num = int(contract_spec.split('_')[0])
-                tn1_list.append(quarter_num)
-            elif contract['tenor'] == 'y':  # Yearly
-                tn1_list.append(int(contract_spec))
-        
-        # Convert period to date range
+        # Convert period to date range first (needed for relative calculation)
         start_date = datetime.strptime(period['start_date'], '%Y-%m-%d')
         end_date = datetime.strptime(period['end_date'], '%Y-%m-%d')
         dates = pd.date_range(start_date, end_date, freq='B')
+        
+        # Calculate relative tenor offsets for SpreadViewer
+        tn1_list = []
+        tn2_list = []
+        
+        # Get the quarter/month of the date range (use start date as reference)
+        reference_date = start_date
+        
+        print(f"🔍 RELATIVE TENOR CALCULATION DEBUG:")
+        print(f"   📅 Reference date: {reference_date}")
+        print(f"   📅 Date range quarter: Q{((reference_date.month-1)//3)+1} {reference_date.year}")
+        
+        for contract in contracts:
+            contract_spec = contract['contract']
+            
+            if contract['tenor'] == 'm':  # Monthly
+                # Extract month and year from contract (format: 'm1_25' = January 2025)
+                parts = contract_spec.split('_')
+                target_month = int(parts[0][1:])  # Extract '1' from 'm1'
+                target_year = 2000 + int(parts[1])  # Convert '25' to 2025
+                
+                # Calculate month difference
+                ref_months = reference_date.year * 12 + reference_date.month
+                target_months = target_year * 12 + target_month
+                relative_months = target_months - ref_months
+                
+                print(f"   📊 Monthly: {contract_spec} → Target M{target_month} {target_year} → Relative: {relative_months} months")
+                tn1_list.append(relative_months)
+                
+            elif contract['tenor'] == 'q':  # Quarterly
+                # Extract quarter and year from contract (format: 'q4_25' = Q4 2025)
+                parts = contract_spec.split('_')
+                target_quarter = int(parts[0][1:])  # Extract '4' from 'q4'
+                target_year = 2000 + int(parts[1])  # Convert '25' to 2025
+                
+                # Calculate current quarter from reference date
+                reference_quarter = ((reference_date.month-1)//3) + 1
+                reference_year = reference_date.year
+                
+                # Calculate quarter difference
+                ref_quarters = reference_year * 4 + (reference_quarter - 1)
+                target_quarters = target_year * 4 + (target_quarter - 1)
+                relative_quarters = target_quarters - ref_quarters
+                
+                print(f"   📊 Quarterly: {contract_spec} → Target Q{target_quarter} {target_year} → Relative: {relative_quarters} quarters")
+                print(f"      Reference: Q{reference_quarter} {reference_year}")
+                print(f"      Target: Q{target_quarter} {target_year}")
+                tn1_list.append(relative_quarters)
+                
+            elif contract['tenor'] == 'y':  # Yearly
+                # Extract year from contract
+                target_year = int(contract_spec)
+                relative_years = target_year - reference_date.year
+                print(f"   📊 Yearly: {contract_spec} → Relative: {relative_years} years")
+                tn1_list.append(relative_years)
+        
+        print(f"   ✅ Final tn1_list (relative tenors): {tn1_list}")
+        print(f"   📝 Expected database queries for: {['q_' + str(abs(t)) if t >= 0 else 'q_-' + str(abs(t)) for t in tn1_list]}")
         
         # Initialize SpreadViewer classes
         spread_class = SpreadSingle(markets, tenors, tn1_list, tn2_list, ['eex'])
