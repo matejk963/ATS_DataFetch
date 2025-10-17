@@ -470,8 +470,17 @@ class DataFetcher:
         series = pd.Series(product_date, index=dates)
         
         for p_d, ds in series.groupby(series).groups.items():
-            bT = datetime.combine(ds[0], start_time)
-            eT = datetime.combine(ds[-1], end_time)
+            # FIXED: Ensure proper datetime objects for TPData compatibility
+            # Convert pandas Timestamp to datetime if needed
+            start_date = ds[0].to_pydatetime() if hasattr(ds[0], 'to_pydatetime') else ds[0]
+            end_date = ds[-1].to_pydatetime() if hasattr(ds[-1], 'to_pydatetime') else ds[-1]
+            
+            bT = datetime.combine(start_date.date(), start_time)
+            eT = datetime.combine(end_date.date(), end_time)
+            
+            # Verify datetime objects are properly formatted
+            if not isinstance(bT, datetime) or not isinstance(eT, datetime):
+                raise ValueError(f"bT and eT must be datetime objects, got {type(bT)}, {type(eT)}")
             
             # Trades
             try:
@@ -522,8 +531,17 @@ class DataFetcher:
         series = pd.Series(product_date, index=dates)
         
         for p_d, ds in series.groupby(series).groups.items():
-            bT = datetime.combine(ds[0], start_time)
-            eT = datetime.combine(ds[-1], end_time)
+            # FIXED: Ensure proper datetime objects for TPData compatibility
+            # Convert pandas Timestamp to datetime if needed
+            start_date = ds[0].to_pydatetime() if hasattr(ds[0], 'to_pydatetime') else ds[0]
+            end_date = ds[-1].to_pydatetime() if hasattr(ds[-1], 'to_pydatetime') else ds[-1]
+            
+            bT = datetime.combine(start_date.date(), start_time)
+            eT = datetime.combine(end_date.date(), end_time)
+            
+            # Verify datetime objects are properly formatted
+            if not isinstance(bT, datetime) or not isinstance(eT, datetime):
+                raise ValueError(f"bT and eT must be datetime objects, got {type(bT)}, {type(eT)}")
             
             # Order book data
             try:

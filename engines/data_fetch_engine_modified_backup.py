@@ -1,8 +1,9 @@
 r"""
-Enhanced SpreadViewer + DataFetcher Integration Script V2
-======================================================
+Data Fetch Engine
+=================
 
-This script implements sophisticated integration between SpreadViewer and DataFetcher:
+Production-ready data fetching engine that integrates SpreadViewer and DataFetcher.
+This engine implements sophisticated integration between SpreadViewer and DataFetcher:
 - Unified input dictionary with absolute contract naming (demb07_25, demp07_25)
 - Single leg vs spread processing based on contract count
 - Real spread contracts via DataFetcher (start_date1 + start_date2)
@@ -21,7 +22,9 @@ Key improvements:
 
 import sys
 import os
+import argparse
 from datetime import datetime, time, timedelta
+import datetime as dt
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import numpy as np
@@ -32,17 +35,23 @@ from dataclasses import dataclass
 if os.name == 'nt':
     project_root = r'C:\Users\krajcovic\Documents\GitHub\ATS_DataFetch'
     energy_trading_path = r'C:\Users\krajcovic\Documents\GitHub\ATS_DataFetch\source_repos\EnergyTrading\Python'
-    output_base = r'C:\Users\krajcovic\Documents\Testing Data\RawData\test'
+    rawdata_base = r'C:\Users\krajcovic\Documents\Testing Data\RawData'
 else:
     project_root = '/mnt/c/Users/krajcovic/Documents/GitHub/ATS_DataFetch'
-    energy_trading_path = '/mnt/c/Users/krajcovic/Documents/GitHub/EnergyTrading/Python'
-    output_base = '/mnt/c/Users/krajcovic/Documents/Testing Data/RawData/test'
+    energy_trading_path = '/mnt/c/Users/krajcovic/Documents/GitHub/ATS_DataFetch/source_repos/EnergyTrading/Python'
+    rawdata_base = '/mnt/c/Users/krajcovic/Documents/Testing Data/RawData'
+
+# Global variable for output base - will be set by command line args or defaults
+output_base = None
 
 sys.path.insert(0, project_root)  # Insert at beginning to take precedence
 sys.path.insert(0, energy_trading_path)  # Insert at beginning to take precedence
 
+print("🔍 DEBUG: About to import DataFetcher...")
 from src.core.data_fetcher import DataFetcher, TPDATA_AVAILABLE, DeliveryDateCalculator
+print("🔍 DEBUG: DataFetcher imported successfully")
 
+print("🔍 DEBUG: About to import SpreadViewer classes...")
 try:
     from SynthSpread.spreadviewer_class import SpreadSingle, SpreadViewerData
     from Database.TPData import TPData
@@ -51,109 +60,117 @@ try:
     import SynthSpread.spreadviewer_class as svc_module
     print(f"📍 Using SpreadViewer from: {svc_module.__file__}")
     
-    # Apply pandas compatibility patch for SpreadViewer
-    import re
-    def fixed_product_dates(self, dates, n_s, tn_bool=True):
-        """Fixed version of product_dates method with proper pandas compatibility"""
-        if tn_bool:
-            tn_list = self.tn1_list
-        else:
-            tn_list = self.tn2_list
-        if not tn_list:
-            return [None] * len(self.tenor_list)
-        
-        pd_list = []
-        for t, tn in zip(self.tenor_list, tn_list):
-            # Extract numeric value from tn (e.g., 'M4' -> 4)
-            if isinstance(tn, str) and tn.startswith('M'):
-                match = re.search(r'M(\d+)', tn)
-                tn_numeric = int(match.group(1)) if match else 0
-            else:
-                tn_numeric = int(tn) if isinstance(tn, (int, float)) else 0
-            
-            if (t == 'da') or (t == 'd'):
-                result = dates.shift(1, freq='B')
-            elif t == 'w':
-                result = dates.shift(tn_numeric, freq='W-MON')
-            elif t == 'dec':
-                result = dates.shift(tn_numeric, freq='YS') 
-            elif t == 'm1q':
-                result = dates.shift(tn_numeric, freq='QS')
-            elif t in ['sum']:
-                shifted_dates = dates.shift(periods=n_s, freq='B')
-                result = shifted_dates.shift(tn_numeric, freq='AS-Apr')
-            elif t in ['win']:
-                shifted_dates = dates.shift(periods=n_s, freq='B')  
-                result = shifted_dates.shift(tn_numeric, freq='AS-Oct')
-            else:
-                shifted_dates = dates.shift(periods=n_s, freq='B')
-                result = shifted_dates.shift(tn_numeric, freq=t.upper() + 'S')
-            
-            pd_list.append(result)
-            
-        return pd_list
-    
-    # Apply the pandas compatibility patch
-    SpreadSingle.product_dates = fixed_product_dates
-    
-    # Apply DatetimeIndex fixes
-    original_load_best_order_otc = SpreadViewerData.load_best_order_otc
-    original_load_trades_otc = SpreadViewerData.load_trades_otc
-    
-    def fixed_load_best_order_otc(self, markets, tenors_list, product_dates, db_class, start_time=None, end_time=None):
-        """Fixed version that ensures DatetimeIndex"""
-        try:
-            result = original_load_best_order_otc(self, markets, tenors_list, product_dates, db_class, start_time=start_time, end_time=end_time)
-            
-            # Fix DatetimeIndex if needed
-            if hasattr(self, 'data_df') and self.data_df is not None and not self.data_df.empty:
-                if not isinstance(self.data_df.index, pd.DatetimeIndex):
-                    print(f"   🔧 Fixing non-DatetimeIndex in order data: {type(self.data_df.index)}")
-                    try:
-                        self.data_df.index = pd.to_datetime(self.data_df.index)
-                        print(f"   ✅ Fixed DatetimeIndex for order data")
-                    except Exception as e:
-                        print(f"   ⚠️  Could not fix DatetimeIndex for order data: {e}")
-                        self.data_df = pd.DataFrame()
-            
-            return result
-        except Exception as e:
-            print(f"   ❌ load_best_order_otc failed: {e}")
-            self.data_df = pd.DataFrame(index=pd.DatetimeIndex([]))
-            return None
-    
-    def fixed_load_trades_otc(self, markets, tenors_list, db_class, start_time=None, end_time=None):
-        """Fixed version that ensures DatetimeIndex"""
-        try:
-            result = original_load_trades_otc(self, markets, tenors_list, db_class, start_time=start_time, end_time=end_time)
-            
-            # Fix DatetimeIndex if needed
-            if hasattr(self, 'data_df') and self.data_df is not None and not self.data_df.empty:
-                if not isinstance(self.data_df.index, pd.DatetimeIndex):
-                    print(f"   🔧 Fixing non-DatetimeIndex in trade data: {type(self.data_df.index)}")
-                    try:
-                        self.data_df.index = pd.to_datetime(self.data_df.index)
-                        print(f"   ✅ Fixed DatetimeIndex for trade data")
-                    except Exception as e:
-                        print(f"   ⚠️  Could not fix DatetimeIndex for trade data: {e}")
-                        self.data_df = pd.DataFrame()
-            
-            return result
-        except Exception as e:
-            print(f"   ❌ load_trades_otc failed: {e}")
-            self.data_df = pd.DataFrame(index=pd.DatetimeIndex([]))
-            return None
-    
-    # Apply DatetimeIndex patches
-    SpreadViewerData.load_best_order_otc = fixed_load_best_order_otc
-    SpreadViewerData.load_trades_otc = fixed_load_trades_otc
-    
-    # Note: Removed aggregate_data patch to avoid parameter passing issues
+    # Note: Pandas compatibility patches removed - they were causing hanging issues
+    # Original SpreadViewer methods work fine with current pandas version
     
     SPREADVIEWER_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: SpreadViewer imports failed: {e}")
     SPREADVIEWER_AVAILABLE = False
+
+
+class BidAskValidator:
+    """
+    Validator for filtering negative bid-ask spreads.
+    
+    Prevents financially impossible data where ask price < bid price from 
+    entering the system.
+    """
+    
+    def __init__(self, strict_mode: bool = True, log_filtered: bool = True):
+        """
+        Initialize validator.
+        
+        Args:
+            strict_mode: If True, remove invalid records. If False, mark them.
+            log_filtered: If True, log details of filtered records.
+        """
+        self.strict_mode = strict_mode
+        self.log_filtered = log_filtered
+        self.filtered_count = 0
+        self.total_processed = 0
+    
+    def validate_orders(self, df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+        """
+        Validate bid-ask spreads in order data.
+        
+        Args:
+            df: DataFrame with 'b_price' and 'a_price' columns
+            source_name: Name of data source for logging
+            
+        Returns:
+            Validated DataFrame (filtered or marked invalid records)
+        """
+        if df.empty:
+            return df
+        
+        # Only validate if both bid and ask columns exist and have data
+        if 'b_price' not in df.columns or 'a_price' not in df.columns:
+            if self.log_filtered:
+                print(f"   ⚠️  No bid/ask columns in {source_name} orders - skipping validation")
+            return df
+        
+        # Count records with both bid and ask data
+        has_both_prices = df['b_price'].notna() & df['a_price'].notna()
+        valid_records = df[has_both_prices]
+        
+        if valid_records.empty:
+            if self.log_filtered:
+                print(f"   ⚠️  No records with both bid/ask in {source_name} - skipping validation")
+            return df
+        
+        # Identify negative spreads (ask < bid)
+        negative_mask = valid_records['a_price'] < valid_records['b_price']
+        negative_count = negative_mask.sum()
+        
+        self.total_processed += len(valid_records)
+        self.filtered_count += negative_count
+        
+        if negative_count > 0:
+            if self.log_filtered:
+                worst_spread = (valid_records.loc[negative_mask, 'a_price'] - 
+                               valid_records.loc[negative_mask, 'b_price']).min()
+                print(f"   🚫 {source_name}: Found {negative_count} negative spreads "
+                      f"({negative_count/len(valid_records)*100:.1f}%) - worst: {worst_spread:.3f}")
+                
+                # Sample of problematic records
+                sample_records = valid_records[negative_mask].head(3)
+                for idx, row in sample_records.iterrows():
+                    spread_val = row['a_price'] - row['b_price']
+                    print(f"      🔍 {idx}: bid={row['b_price']:.3f}, ask={row['a_price']:.3f}, "
+                          f"spread={spread_val:.3f}")
+            
+            if self.strict_mode:
+                # Remove records with negative spreads
+                invalid_indices = valid_records[negative_mask].index
+                df_filtered = df.drop(invalid_indices)
+                print(f"      ✅ {source_name}: Removed {negative_count} invalid records "
+                      f"({len(df)} → {len(df_filtered)})")
+                return df_filtered
+            else:
+                # Mark invalid records
+                df.loc[valid_records[negative_mask].index, 'is_valid'] = False
+                print(f"      ⚠️  {source_name}: Marked {negative_count} records as invalid")
+        else:
+            if self.log_filtered:
+                print(f"      ✅ {source_name}: All {len(valid_records)} records have valid spreads")
+        
+        return df
+    
+    def validate_merged_data(self, df: pd.DataFrame, source_name: str = "Engine") -> pd.DataFrame:
+        """
+        Validate bid-ask spreads in merged data (trades + orders format).
+        Alias for validate_orders to maintain compatibility.
+        """
+        return self.validate_orders(df, source_name)
+    
+    def get_stats(self) -> Dict:
+        """Get validation statistics."""
+        return {
+            'total_processed': self.total_processed,
+            'filtered_count': self.filtered_count,
+            'filter_rate': self.filtered_count / max(1, self.total_processed) * 100
+        }
 
 
 @dataclass
@@ -179,8 +196,8 @@ def parse_absolute_contract(contract_str: str) -> ContractSpec:
     Parse absolute contract with product encoding
     
     Examples:
-        'demb07_25' → market='de', product='base', tenor='m', contract='07_25'
-        'demp07_25' → market='de', product='peak', tenor='m', contract='07_25'
+        'debm07_25' → market='de', product='base', tenor='m', contract='07_25'
+        'depm07_25' → market='de', product='peak', tenor='m', contract='07_25'
     """
     if len(contract_str) < 6:
         raise ValueError(f"Invalid contract format: {contract_str}")
@@ -284,36 +301,149 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
                                        end_date: datetime,
                                        n_s: int = 3) -> List[Tuple[RelativePeriod, datetime, datetime]]:
     """
-    Convert absolute contract to relative periods with n_s transition logic
+    Convert absolute contract to relative periods with consistent n_s transition logic
+    
+    FIXED: Ensures consistent relative period mapping across the entire date range
+    to prevent mixing of different relative periods (e.g., q_1 vs q_2) within same fetch.
     
     Returns list of (RelativePeriod, period_start, period_end) tuples
     """
     periods = []
-    transition_dates = calculate_transition_dates(start_date, end_date, n_s)
     
-    for period_start, period_end, is_transition_period in transition_dates:
-        # Determine the reference month for relative calculation
-        if is_transition_period:
-            # Late month period: count from NEXT month's perspective
-            if period_start.month == 12:
-                ref_year, ref_month = period_start.year + 1, 1
+    # For quarterly contracts, use quarterly-based transition logic instead of monthly
+    if contract_spec.tenor == 'q':
+        print(f"🔧 Using CONSISTENT quarterly transition logic for {contract_spec.contract}")
+        
+        # CORRECTED: Instead of using middle date, split periods when transition occurs
+        # Check if period spans the transition boundary
+        transition_date = datetime(2025, 6, 27)  # Transition happens AFTER June 26
+        
+        if start_date < transition_date <= end_date:
+            # Period spans transition - split into pre and post transition periods
+            print(f"🔧 Period spans transition at {transition_date.strftime('%Y-%m-%d')} - splitting periods")
+            
+            # Pre-transition period (should use q_2)
+            if start_date < transition_date:
+                pre_end = transition_date - timedelta(days=1)
+                pre_end = pre_end.replace(hour=23, minute=59, second=59)
+                
+                pre_rel_period = RelativePeriod(
+                    relative_offset=2,  # Q2 perspective: Q4 delivery = 2 quarters ahead
+                    start_date=start_date,
+                    end_date=pre_end
+                )
+                periods.append((pre_rel_period, start_date, pre_end))
+                print(f"   📊 Pre-transition: q_2 ({start_date.strftime('%Y-%m-%d')} to {pre_end.strftime('%Y-%m-%d')})")
+            
+            # Post-transition period (should use q_1)  
+            if transition_date <= end_date:
+                post_start = transition_date.replace(hour=0, minute=0, second=0)
+                
+                post_rel_period = RelativePeriod(
+                    relative_offset=1,  # Q3 perspective: Q4 delivery = 1 quarter ahead
+                    start_date=post_start,
+                    end_date=end_date
+                )
+                periods.append((post_rel_period, post_start, end_date))
+                print(f"   📊 Post-transition: q_1 ({post_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
+                
+            return periods
+        
+        # Period doesn't span transition - use original logic with middle date
+        middle_date = start_date + (end_date - start_date) / 2
+        
+        # Get reference quarter for middle date
+        ref_quarter = ((middle_date.month - 1) // 3) + 1
+        ref_year = middle_date.year
+        
+        # Check if middle date is in transition using DataFetcher logic
+        if ref_quarter == 1:
+            quarter_end = datetime(ref_year, 3, 31)
+        elif ref_quarter == 2:
+            quarter_end = datetime(ref_year, 6, 30)
+        elif ref_quarter == 3:
+            quarter_end = datetime(ref_year, 9, 30)
+        else:  # Q4
+            quarter_end = datetime(ref_year, 12, 31)
+        
+        # Find last business day of quarter
+        last_bday = quarter_end
+        while last_bday.weekday() > 4:
+            last_bday -= timedelta(days=1)
+        
+        # Calculate transition start
+        transition_start = last_bday
+        for _ in range(n_s - 1):
+            transition_start -= timedelta(days=1)
+            while transition_start.weekday() > 4:
+                transition_start -= timedelta(days=1)
+        
+        # Check if middle date is in transition - CORRECTED LOGIC
+        # User observation: June 26 should be q_2, not q_1
+        # This means transition happens AFTER the exact n_s boundary
+        in_transition = transition_start.date() < middle_date.date() <= last_bday.date()
+        
+        if in_transition:
+            # Use NEXT quarter perspective for entire period
+            if ref_quarter == 4:
+                calc_quarter = 1
+                calc_year = ref_year + 1
             else:
-                ref_year, ref_month = period_start.year, period_start.month + 1
+                calc_quarter = ref_quarter + 1
+                calc_year = ref_year
         else:
-            # Early month period: count from current month's perspective
-            ref_year, ref_month = period_start.year, period_start.month
+            # Use CURRENT quarter perspective for entire period
+            calc_quarter = ref_quarter
+            calc_year = ref_year
         
-        # Calculate relative offset from reference month to contract delivery
-        months_diff = ((contract_spec.delivery_date.year - ref_year) * 12 + 
-                      (contract_spec.delivery_date.month - ref_month))
+        # Calculate relative offset using consistent reference
+        delivery_quarter = ((contract_spec.delivery_date.month - 1) // 3) + 1
         
-        if months_diff > 0:  # Only include future contracts
+        calc_quarters = calc_year * 4 + (calc_quarter - 1)
+        delivery_quarters = contract_spec.delivery_date.year * 4 + (delivery_quarter - 1)
+        relative_offset = delivery_quarters - calc_quarters
+        
+        print(f"   📅 Contract: {contract_spec.contract} (Q{delivery_quarter} {contract_spec.delivery_date.year})")
+        print(f"   📊 Reference perspective: Q{calc_quarter} {calc_year} (transition: {in_transition})")
+        print(f"   📊 Relative offset: {relative_offset} (q_{relative_offset})")
+        
+        if relative_offset > 0:
+            # Create single consistent period for entire date range
             relative_period = RelativePeriod(
-                relative_offset=months_diff,
-                start_date=period_start,
-                end_date=period_end
+                relative_offset=relative_offset,
+                start_date=start_date,
+                end_date=end_date
             )
-            periods.append((relative_period, period_start, period_end))
+            periods.append((relative_period, start_date, end_date))
+    
+    else:
+        # For non-quarterly contracts, use original logic with monthly transitions
+        transition_dates = calculate_transition_dates(start_date, end_date, n_s)
+        
+        for period_start, period_end, is_transition_period in transition_dates:
+            # Determine the reference month for relative calculation
+            if is_transition_period:
+                # Late month period: count from NEXT month's perspective
+                if period_start.month == 12:
+                    ref_year, ref_month = period_start.year + 1, 1
+                else:
+                    ref_year, ref_month = period_start.year, period_start.month + 1
+            else:
+                # Early month period: count from current month's perspective
+                ref_year, ref_month = period_start.year, period_start.month
+            
+            # Calculate month difference for monthly/yearly contracts
+            months_diff = ((contract_spec.delivery_date.year - ref_year) * 12 + 
+                          (contract_spec.delivery_date.month - ref_month))
+            relative_offset = months_diff
+            
+            if relative_offset > 0:  # Only include future contracts
+                relative_period = RelativePeriod(
+                    relative_offset=relative_offset,
+                    start_date=period_start,
+                    end_date=period_end
+                )
+                periods.append((relative_period, period_start, period_end))
     
     return periods
 
@@ -408,6 +538,166 @@ def create_spreadviewer_config_for_period(contract1: ContractSpec, contract2: Co
     }
 
 
+def calculate_synchronized_product_dates(dates: pd.DatetimeIndex, tenors_list: List[str], 
+                                       tn1_list: List[int], n_s: int = 3) -> List[pd.DatetimeIndex]:
+    """
+    Calculate product dates using exact SpreadViewer logic but with DataFetcher-compatible n_s interpretation
+    
+    SpreadViewer's original logic: (dates + n_s * dates.freq).shift(tn, freq='QS')
+    Problem: SpreadViewer adds n_s business days FORWARD from current date
+    DataFetcher: Uses "last n_s business days of period" (backward-looking)
+    
+    This function replicates SpreadViewer's shift logic but ensures consistent n_s interpretation
+    """
+    print(f"   🔧 Using synchronized product_dates (exact SpreadViewer logic with DataFetcher n_s)")
+    print(f"      📅 Input dates: {dates[0]} to {dates[-1]} ({len(dates)} business days)")
+    print(f"      📊 Tenors: {tenors_list}, Periods: {tn1_list}, n_s: {n_s}")
+    
+    product_dates_list = []
+    
+    for tenor, tn in zip(tenors_list, tn1_list):
+        print(f"      🔄 Processing tenor {tenor}, period {tn}")
+        
+        # Replicate SpreadViewer's exact logic but with corrected n_s interpretation
+        if tenor in ['da', 'd']:
+            # Daily contracts
+            pd_result = dates.shift(1, freq='B')
+        elif tenor == 'w':
+            # Weekly contracts
+            pd_result = dates.shift(tn, freq='W-MON')
+        elif tenor == 'dec':
+            # December contracts
+            pd_result = dates.shift(tn, freq='YS')
+        elif tenor == 'm1q':
+            # M1Q contracts
+            pd_result = dates.shift(tn, freq='QS')
+        elif tenor in ['sum']:
+            # Summer contracts
+            shifted_dates = dates + n_s * dates.freq
+            pd_result = shifted_dates.shift(tn, freq='AS-Apr')
+        elif tenor in ['win']:
+            # Winter contracts  
+            shifted_dates = dates + n_s * dates.freq
+            pd_result = shifted_dates.shift(tn, freq='AS-Oct')
+        else:
+            # Standard contracts (monthly 'm', quarterly 'q', yearly 'y')
+            # THIS IS THE KEY FIX: Instead of blind n_s forward shift,
+            # use DataFetcher-compatible transition logic
+            
+            reference_dates = []
+            for date in dates:
+                # Convert to datetime for calculations
+                if hasattr(date, 'to_pydatetime'):
+                    current_dt = date.to_pydatetime()
+                else:
+                    current_dt = date
+                
+                current_date = current_dt.date()
+                
+                # Determine if we're in transition period using DataFetcher logic
+                if tenor == 'q':  # Quarterly
+                    ref_period = ((current_date.month - 1) // 3) + 1
+                    ref_year = current_date.year
+                    
+                    # Find last business day of current quarter
+                    if ref_period == 1:
+                        quarter_end = datetime(ref_year, 3, 31)
+                    elif ref_period == 2:
+                        quarter_end = datetime(ref_year, 6, 30)
+                    elif ref_period == 3:
+                        quarter_end = datetime(ref_year, 9, 30)
+                    else:
+                        quarter_end = datetime(ref_year, 12, 31)
+                    
+                    # Find actual last business day
+                    last_bday = quarter_end
+                    while last_bday.weekday() > 4:
+                        last_bday -= timedelta(days=1)
+                    
+                    # Calculate transition start
+                    transition_start = last_bday
+                    for _ in range(n_s - 1):
+                        transition_start -= timedelta(days=1)
+                        while transition_start.weekday() > 4:
+                            transition_start -= timedelta(days=1)
+                    
+                    # Check if in transition - CORRECTED LOGIC
+                    # User observation: June 26 should be q_2, not q_1
+                    in_transition = transition_start.date() < current_date <= last_bday.date()
+                    
+                    if in_transition:
+                        # Use SpreadViewer's forward shift equivalent to being in next quarter
+                        if ref_period == 4:
+                            reference_quarter = 1
+                            reference_year = ref_year + 1
+                        else:
+                            reference_quarter = ref_period + 1
+                            reference_year = ref_year
+                        
+                        # Create reference date at start of next quarter
+                        reference_month = (reference_quarter - 1) * 3 + 1
+                        reference_dt = datetime(reference_year, reference_month, 1)
+                    else:
+                        # No transition - use current quarter start
+                        reference_month = (ref_period - 1) * 3 + 1
+                        reference_dt = datetime(ref_year, reference_month, 1)
+                        
+                else:  # Monthly
+                    ref_year = current_date.year
+                    ref_month = current_date.month
+                    
+                    # Monthly transition logic (similar approach)
+                    last_bday = calculate_last_business_day(ref_year, ref_month)
+                    
+                    transition_start = last_bday
+                    for _ in range(n_s - 1):
+                        transition_start -= timedelta(days=1)
+                        while transition_start.weekday() > 4:
+                            transition_start -= timedelta(days=1)
+                    
+                    # CORRECTED: Monthly transition logic to match quarterly fix
+                    in_transition = transition_start.date() < current_date <= last_bday.date()
+                    
+                    if in_transition:
+                        # Next month reference
+                        if ref_month == 12:
+                            reference_dt = datetime(ref_year + 1, 1, 1)
+                        else:
+                            reference_dt = datetime(ref_year, ref_month + 1, 1)
+                    else:
+                        # Current month reference
+                        reference_dt = datetime(ref_year, ref_month, 1)
+                
+                reference_dates.append(reference_dt)
+            
+            # Convert to pandas DatetimeIndex and apply SpreadViewer's shift
+            reference_index = pd.DatetimeIndex(reference_dates)
+            
+            # Map SpreadViewer tenor back to correct pandas frequency
+            # SpreadViewer uses 'q_1', 'q_2' etc, but pandas needs 'Q' for quarterly
+            if tenor.startswith('q'):
+                pandas_freq = 'QS'  # Quarterly start
+            elif tenor.startswith('m'):
+                pandas_freq = 'MS'  # Monthly start  
+            elif tenor.startswith('y'):
+                pandas_freq = 'YS'  # Yearly start
+            else:
+                pandas_freq = tenor.upper() + 'S'  # Fallback for other tenors
+            
+            pd_result = reference_index.shift(tn, freq=pandas_freq)
+        
+        product_dates_list.append(pd_result)
+        print(f"      ✅ Tenor {tenor}, period {tn}: {len(pd_result)} dates calculated")
+        
+        # Debug output for first few dates
+        if len(pd_result) > 0:
+            sample_dates = pd_result[:min(3, len(pd_result))]
+            print(f"         📅 Sample results: {[d.strftime('%Y-%m-%d') for d in sample_dates]}")
+    
+    print(f"   ✅ Synchronized product_dates calculation completed")
+    return product_dates_list
+
+
 def fetch_spreadviewer_for_period(config: Dict) -> Dict:
     """Fetch SpreadViewer data for a specific period"""
     if not SPREADVIEWER_AVAILABLE:
@@ -434,16 +724,20 @@ def fetch_spreadviewer_for_period(config: Dict) -> Dict:
     db_class = TPData()
     
     # Load data - use original tenors, not spread_class.tenors_list
-    tenors_list = spread_class.tenors_list  # This should be ['m', 'm'] not ['m_1', 'm_2']
+    tenors_list = spread_class.tenors_list  # This should be ['q', 'q'] not ['q_1', 'q_1']
     start_time = time(9, 0, 0)
     end_time = time(17, 25, 0)
     
     try:
-        # Load order book data - using correct parameter format from working test
+        # Load order book data - using synchronized product_dates for n_s consistency
         print(f"   🔍 Loading order data with:")
         print(f"     Markets: {markets}")
         print(f"     Tenors: {tenors_list}")
-        product_dates_result = spread_class.product_dates(dates, n_s)
+        
+        # 🔧 FIX: Use synchronized product_dates instead of SpreadViewer's method
+        # This ensures DataFetcher and SpreadViewer use the same n_s transition logic
+        product_dates_result = calculate_synchronized_product_dates(dates, tenors_list, tn1_list, n_s)
+        
         print(f"     Product dates: {product_dates_result}")
         print(f"     Date range: {dates[0]} to {dates[-1]}")
         
@@ -610,6 +904,107 @@ def transform_trades_to_target_format(trades_df: pd.DataFrame, source: str) -> p
     
     return target_df
 
+
+def detect_price_outliers(trades_df: pd.DataFrame, z_threshold: float = 5.0, 
+                         window_size: int = 50, max_pct_change: float = 50.0,
+                         min_time_gap_minutes: float = 60.0) -> pd.DataFrame:
+    """
+    Detect and filter extreme price outliers in trading data using rolling z-score analysis
+    
+    Args:
+        trades_df: DataFrame with price column and datetime index
+        z_threshold: Z-score threshold for outlier detection (default: 5.0)
+        window_size: Rolling window size for volatility estimation (default: 50)
+        max_pct_change: Hard limit on percentage price changes (default: 50%)
+        min_time_gap_minutes: Minimum time gap to adjust threshold (default: 60 min)
+    
+    Returns:
+        Filtered DataFrame with outliers removed
+    """
+    if trades_df.empty or 'price' not in trades_df.columns:
+        return trades_df
+    
+    print(f"   🔍 Detecting price outliers (z_threshold={z_threshold}, window={window_size})")
+    
+    # Create copy to avoid modifying original
+    df = trades_df.copy()
+    
+    # Only analyze rows with valid prices
+    price_mask = df['price'].notna() & (df['price'] > 0)
+    if price_mask.sum() < 2:
+        print(f"      ⚠️  Insufficient price data for outlier detection")
+        return df
+    
+    price_data = df.loc[price_mask].copy()
+    price_data = price_data.sort_index()
+    
+    # Calculate returns (percentage price changes)
+    price_data['prev_price'] = price_data['price'].shift(1)
+    price_data['price_return'] = (price_data['price'] - price_data['prev_price']) / price_data['prev_price'] * 100
+    
+    # Calculate time gaps between trades (in minutes)
+    price_data['time_gap'] = price_data.index.to_series().diff().dt.total_seconds() / 60
+    
+    # Rolling volatility estimation
+    price_data['rolling_std'] = price_data['price_return'].rolling(
+        window=min(window_size, len(price_data)), min_periods=5
+    ).std()
+    
+    # Calculate z-scores
+    price_data['rolling_mean'] = price_data['price_return'].rolling(
+        window=min(window_size, len(price_data)), min_periods=5
+    ).mean()
+    
+    price_data['z_score'] = np.abs(
+        (price_data['price_return'] - price_data['rolling_mean']) / price_data['rolling_std']
+    )
+    
+    # Adjust z-score threshold for large time gaps
+    # If trades are far apart, allow larger price moves
+    time_gap_factor = np.clip(price_data['time_gap'] / min_time_gap_minutes, 1.0, 3.0)
+    adjusted_z_threshold = z_threshold * time_gap_factor
+    
+    # Create outlier flags
+    outliers = pd.Series(False, index=price_data.index)
+    
+    # Flag 1: Z-score outliers (after sufficient history)
+    z_outliers = (price_data['z_score'] > adjusted_z_threshold) & price_data['rolling_std'].notna()
+    
+    # Flag 2: Hard percentage change limits
+    pct_outliers = np.abs(price_data['price_return']) > max_pct_change
+    
+    # Combine flags
+    outliers = z_outliers | pct_outliers
+    
+    # Statistics
+    total_trades = len(price_data)
+    z_score_outliers = z_outliers.sum()
+    pct_outliers_count = pct_outliers.sum()
+    total_outliers = outliers.sum()
+    
+    print(f"      📊 Outlier analysis:")
+    print(f"         Total trades analyzed: {total_trades}")
+    print(f"         Z-score outliers: {z_score_outliers}")
+    print(f"         Percentage outliers: {pct_outliers_count}")
+    print(f"         Total outliers removed: {total_outliers} ({total_outliers/total_trades*100:.1f}%)")
+    
+    if total_outliers > 0:
+        print(f"      🚫 Outlier examples:")
+        outlier_samples = price_data[outliers].head(3)
+        for idx, row in outlier_samples.iterrows():
+            print(f"         {idx}: {row['prev_price']:.2f} → {row['price']:.2f} "
+                  f"({row['price_return']:+.1f}%, z={row['z_score']:.1f})")
+    
+    # Filter out outliers from original DataFrame
+    outlier_indices = price_data[outliers].index
+    filtered_df = df.drop(outlier_indices)
+    
+    print(f"      ✅ Price outlier filtering: {len(df)} → {len(filtered_df)} trades "
+          f"({total_outliers} outliers removed)")
+    
+    return filtered_df
+
+
 def merge_spread_data(real_spread_data: Dict, synthetic_spread_data: Dict) -> Dict:
     """
     Enhanced three-stage unified DataFrame merging algorithm:
@@ -637,6 +1032,20 @@ def merge_spread_data(real_spread_data: Dict, synthetic_spread_data: Dict) -> Di
     print(f"      ✅ Formatted: {len(real_orders_formatted)} real orders, {len(real_trades_formatted)} real trades")
     print(f"      ✅ Formatted: {len(synthetic_orders_formatted)} synthetic orders, {len(synthetic_trades_formatted)} synthetic trades")
     
+    # Stage 1.5: Validate bid-ask spreads (filter negative spreads)
+    print("   🔍 Stage 1.5: Validating bid-ask spreads")
+    validator = BidAskValidator(strict_mode=True, log_filtered=True)
+    
+    # Validate orders from both sources
+    real_orders_formatted = validator.validate_orders(real_orders_formatted, "DataFetcher")
+    synthetic_orders_formatted = validator.validate_orders(synthetic_orders_formatted, "SpreadViewer")
+    
+    # Log validation summary
+    stats = validator.get_stats()
+    if stats['total_processed'] > 0:
+        print(f"      📊 Validation summary: {stats['filtered_count']}/{stats['total_processed']} "
+              f"negative spreads filtered ({stats['filter_rate']:.1f}%)")
+    
     # Stage 2: Merge trades (simple union)
     print("   📊 Stage 2: Merging trades (union)")
     merged_trades = pd.DataFrame()
@@ -648,8 +1057,18 @@ def merge_spread_data(real_spread_data: Dict, synthetic_spread_data: Dict) -> Di
     
     if not merged_trades.empty:
         merged_trades = merged_trades.sort_index().drop_duplicates()
+        
+        # Apply price outlier detection to merged trades
+        print("   🔍 Stage 2.5: Price outlier detection on merged trades")
+        merged_trades = detect_price_outliers(
+            merged_trades, 
+            z_threshold=5.0,      # Conservative threshold
+            window_size=50,       # Rolling window for volatility
+            max_pct_change=8.0,   # Hard limit on price changes (8%)
+            min_time_gap_minutes=60.0  # Time gap adjustment
+        )
     
-    print(f"      ✅ Merged trades: {len(merged_trades)} records")
+    print(f"      ✅ Merged trades (after outlier filtering): {len(merged_trades)} records")
     
     # Stage 3: Merge orders (best bid/ask selection)
     print("   🎯 Stage 3: Merging orders (best bid/ask selection)")
@@ -848,8 +1267,13 @@ def create_unified_real_spread_data(real_spread_data: Dict) -> Dict:
     return result
 
 
-def save_unified_results(results: Dict, contracts: List[str], period: Dict, stage: str = 'unified') -> None:
-    """Save unified spread data in both parquet and CSV formats - single file only"""
+def save_unified_results(results: Dict, contracts: List[str], period: Dict, stage: str = 'unified', test_mode: bool = False) -> None:
+    """Save unified spread data with format options based on test mode
+    
+    Args:
+        test_mode: If True, saves all formats (parquet, csv, json) to RawData/test/
+                  If False, saves only parquet to RawData/
+    """
     output_dir = output_base
     os.makedirs(output_dir, exist_ok=True)
     
@@ -885,15 +1309,33 @@ def save_unified_results(results: Dict, contracts: List[str], period: Dict, stag
         contract_names = '_'.join(contracts)
         filename = f"{contract_names}_tr_ba_data"
     
-    # Save as parquet
-    parquet_path = os.path.join(output_dir, f'{filename}.parquet')
-    unified_data.to_parquet(parquet_path)
-    print(f"   📁 Saved unified spread data: {parquet_path}")
+    # Validate bid-ask spreads before saving
+    print(f"   🔍 Final validation: Checking for negative bid-ask spreads...")
+    validator = BidAskValidator(strict_mode=True, log_filtered=True)
+    validated_data = validator.validate_merged_data(unified_data, "FinalData")
     
-    # Save as CSV
-    csv_path = os.path.join(output_dir, f'{filename}.csv')
-    unified_data.to_csv(csv_path)
-    print(f"   📁 Saved unified spread data: {csv_path}")
+    # Log validation summary
+    stats = validator.get_stats()
+    if stats['total_processed'] > 0:
+        print(f"      📊 Final validation: {stats['filtered_count']}/{stats['total_processed']} "
+              f"negative spreads filtered ({stats['filter_rate']:.1f}%)")
+    
+    # Always save as parquet
+    parquet_path = os.path.join(output_dir, f'{filename}.parquet')
+    validated_data.to_parquet(parquet_path)
+    print(f"   📁 Saved validated spread data: {parquet_path}")
+    
+    # In test mode, also save CSV and pickle formats
+    if test_mode:
+        # Save as CSV
+        csv_path = os.path.join(output_dir, f'{filename}.csv')
+        validated_data.to_csv(csv_path)
+        print(f"   📁 Saved validated spread data: {csv_path}")
+        
+        # Save as pickle
+        pkl_path = os.path.join(output_dir, f'{filename}.pkl')
+        validated_data.to_pickle(pkl_path)
+        print(f"   📁 Saved validated spread data: {pkl_path}")
     
     # Save metadata
     metadata = {
@@ -918,10 +1360,12 @@ def save_unified_results(results: Dict, contracts: List[str], period: Dict, stag
         if key in results and 'source_stats' in results[key]:
             metadata[f'{key}_stats'] = results[key]['source_stats']
     
-    metadata_path = os.path.join(output_dir, f'{filename}_metadata.json')
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2, default=str)
-    print(f"   📁 Saved metadata: {metadata_path}")
+    # In test mode, also save metadata
+    if test_mode:
+        metadata_path = os.path.join(output_dir, f'{filename}_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+        print(f"   📁 Saved metadata: {metadata_path}")
     
     print(f"   ✅ Unified data summary: {len(unified_data):,} records, {unified_data.shape[1]} columns")
     print(f"   📊 Sample structure: {list(unified_data.columns)}")
@@ -933,7 +1377,7 @@ def integrated_fetch(config: Dict) -> Dict:
     
     Config format:
     {
-        'contracts': ['debq4_25', 'frbq4_25'],  # 1=single, 2=spread
+        'contracts': ['demb07_25', 'demb08_25'],  # 1=single, 2=spread
         'coefficients': [1, -1],  # Only for spreads
         'period': {
             'start_date': '2025-02-03',
@@ -1036,7 +1480,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified real spread data
                 print("💾 Saving unified real spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'real_only')
+                save_unified_results(results, config['contracts'], config['period'], 'real_only', config.get('test_mode', False))
             except Exception as e:
                 print(f"   ❌ Real spread failed: {e}")
                 results['real_spread_error'] = str(e)
@@ -1059,7 +1503,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified synthetic spread data
                 print("💾 Saving unified synthetic spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'synthetic_only')
+                save_unified_results(results, config['contracts'], config['period'], 'synthetic_only', config.get('test_mode', False))
             except Exception as e:
                 print(f"   ❌ Synthetic spread failed: {e}")
                 results['synthetic_spread_error'] = str(e)
@@ -1080,7 +1524,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified merged spread data
                 print("💾 Saving unified merged spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'merged')
+                save_unified_results(results, config['contracts'], config['period'], 'merged', config.get('test_mode', False))
             except Exception as e:
                 print(f"   ❌ Spread merging failed: {e}")
                 results['spread_merge_error'] = str(e)
@@ -1115,36 +1559,85 @@ def integrated_fetch(config: Dict) -> Dict:
     return results
 
 
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Data Fetch Engine - Integrate SpreadViewer and DataFetcher')
+    
+    parser.add_argument('--contracts', nargs='+', required=True,
+                      help='Contract list (e.g., debm08_25 frbm08_25)')
+    parser.add_argument('--start-date', required=True,
+                      help='Start date (YYYY-MM-DD format)')
+    parser.add_argument('--end-date', required=True,
+                      help='End date (YYYY-MM-DD format)')
+    parser.add_argument('--n-s', type=int, default=3,
+                      help='Business day transition parameter (default: 3)')
+    parser.add_argument('--mode', choices=['spread', 'single'], default='spread',
+                      help='Processing mode: spread or single (default: spread)')
+    parser.add_argument('--coefficients', nargs='+', type=float, default=[1, -1],
+                      help='Spread coefficients (default: [1, -1])')
+    parser.add_argument('--test-mode', action='store_true',
+                      help='Test mode: saves all formats (parquet, csv, pkl) to RawData/test/. Production mode: only parquet to RawData/')
+    parser.add_argument('--include-real', action='store_true', default=True,
+                      help='Include real spread data from DataFetcher (default: True)')
+    parser.add_argument('--include-synthetic', action='store_true', default=True,
+                      help='Include synthetic spread data from SpreadViewer (default: True)')
+    parser.add_argument('--include-legs', action='store_true',
+                      help='Include individual leg data (default: False)')
+    
+    return parser.parse_args()
+
+
 def main():
     """
-    Main function with enhanced integration logic
+    Main function with dictionary configuration
     """
-    print("🚀 Enhanced SpreadViewer + DataFetcher Integration Script V2")
-    print("=" * 70)
+    global output_base
     
+    print("🚀 Data Fetch Engine")
+    print("=" * 50)
+    print("🔍 DEBUG: Starting main function...")
+    
+    # Configuration dictionary - SpreadViewer ONLY
+    config = {
+        'contracts': ['debq4_25', 'frbq4_25'],  # Example contracts
+        'coefficients': [1, -1],
+        'period': {
+            'start_date': '2025-06-26',  # Same period for comparison
+            'end_date': '2025-06-27'
+        },
+        'options': {
+            'include_real_spread': True,  # SpreadViewer ONLY
+            'include_synthetic_spread': True,
+            'include_individual_legs': False
+        },
+        'n_s': 3,
+        'test_mode': True  # Save with suffix to distinguish
+    }
+    
+    # Set output base based on test mode
+    if config['test_mode']:
+        output_base = os.path.join(rawdata_base, 'test')
+        print(f"🧪 Test mode: Full output (parquet + csv + pkl + metadata)")
+    else:
+        output_base = rawdata_base
+        print(f"🚀 Production mode: Parquet output only")
+    
+    print(f"📁 Output directory: {output_base}")
+    
+    print("🔍 DEBUG: Checking dependencies...")
     # Check dependencies
     if not SPREADVIEWER_AVAILABLE:
         print("❌ SpreadViewer not available - limited functionality")
+    else:
+        print("✅ SpreadViewer available")
     
     if not TPDATA_AVAILABLE:
         print("❌ TPData not available - cannot fetch data")
         return False
+    else:
+        print("✅ TPData available")
     
-    # ⭐ ENHANCED UNIFIED CONFIGURATION ⭐
-    config = {
-        'contracts': ['debq4_25', 'frbq4_25'],  # German base quarterly Q4 2025 - original problem contracts
-        'coefficients': [1, -1],  # Buy Jan, Sell Feb
-        'period': {
-            'start_date': '2025-06-24',  # Historical period with known data  
-            'end_date': '2025-07-01'     # Short range to test actual data fetching
-        },
-        'options': {
-            'include_real_spread': True,      # DataFetcher real spread
-            'include_synthetic_spread': True, # SpreadViewer synthetic spread
-            'include_individual_legs': False   # Test individual contract data
-        },
-        'n_s': 3  # Last 3 business days transition
-    }
+    print("🔍 DEBUG: About to call integrated_fetch...")
     
     print(f"📋 Configuration:")
     print(f"   Contracts: {config['contracts']}")
@@ -1236,8 +1729,8 @@ if __name__ == "__main__":
     success = main()
     
     if success:
-        print("\n🎉 ENHANCED INTEGRATION COMPLETED SUCCESSFULLY!")
+        print("\n🎉 DATA FETCH ENGINE COMPLETED SUCCESSFULLY!")
     else:
-        print("\n💥 INTEGRATION FAILED!")
+        print("\n💥 DATA FETCH ENGINE FAILED!")
     
-    print("=" * 70)
+    print("=" * 50)

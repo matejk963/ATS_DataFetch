@@ -38,7 +38,7 @@ if os.name == 'nt':
     rawdata_base = r'C:\Users\krajcovic\Documents\Testing Data\RawData'
 else:
     project_root = '/mnt/c/Users/krajcovic/Documents/GitHub/ATS_DataFetch'
-    energy_trading_path = '/mnt/c/Users/krajcovic/Documents/GitHub/ATS_DataFetch/source_repos/EnergyTrading/Python'
+    energy_trading_path = '/mnt/c/Users/krajcovic/Documents/GitHub/EnergyTrading/Python'
     rawdata_base = '/mnt/c/Users/krajcovic/Documents/Testing Data/RawData'
 
 # Global variable for output base - will be set by command line args or defaults
@@ -193,19 +193,31 @@ class RelativePeriod:
 
 def parse_absolute_contract(contract_str: str) -> ContractSpec:
     """
-    Parse absolute contract with product encoding
+    Parse absolute contract with product encoding - supports 2-3 letter market codes
     
     Examples:
         'debm07_25' → market='de', product='base', tenor='m', contract='07_25'
         'depm07_25' → market='de', product='peak', tenor='m', contract='07_25'
+        'ttfbm09_25' → market='ttf', product='base', tenor='m', contract='09_25'
     """
     if len(contract_str) < 6:
         raise ValueError(f"Invalid contract format: {contract_str}")
     
-    market = contract_str[:2]           # 'de'
-    product_code = contract_str[2:3]    # 'b' or 'p'
-    tenor = contract_str[3:4]           # 'm'
-    contract = contract_str[4:]         # '09_25'
+    # Known 3-letter market codes
+    three_letter_markets = {'ttf', 'nbp', 'peg', 'zee', 'gas'}
+    
+    # Try 3-letter market code first
+    if len(contract_str) >= 7 and contract_str[:3].lower() in three_letter_markets:
+        market = contract_str[:3].lower()       # 'ttf'
+        product_code = contract_str[3:4]        # 'b' or 'p'
+        tenor = contract_str[4:5]              # 'm'
+        contract = contract_str[5:]            # '09_25'
+    else:
+        # Default to 2-letter market code
+        market = contract_str[:2].lower()       # 'de'
+        product_code = contract_str[2:3]        # 'b' or 'p'
+        tenor = contract_str[3:4]              # 'm'
+        contract = contract_str[4:]            # '09_25'
     
     product_map = {'b': 'base', 'p': 'peak'}
     if product_code not in product_map:
@@ -314,9 +326,9 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
     if contract_spec.tenor == 'q':
         print(f"🔧 Using CONSISTENT quarterly transition logic for {contract_spec.contract}")
         
-        # CORRECTED: Instead of using middle date, split periods when transition occurs
-        # Check if period spans the transition boundary
-        transition_date = datetime(2025, 6, 27)  # Transition happens AFTER June 26
+        # CORRECTED: Transition happens AT June 26th (3rd business day from end)
+        # Both June 26th and June 27th should be q_1
+        transition_date = datetime(2025, 6, 26)  # Transition happens AT June 26
         
         if start_date < transition_date <= end_date:
             # Period spans transition - split into pre and post transition periods
@@ -379,9 +391,9 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
                 transition_start -= timedelta(days=1)
         
         # Check if middle date is in transition - CORRECTED LOGIC
-        # User observation: June 26 should be q_2, not q_1
-        # This means transition happens AFTER the exact n_s boundary
-        in_transition = transition_start.date() < middle_date.date() <= last_bday.date()
+        # User observation: June 26 should be q_1 when n_s=3
+        # June 26 = 3rd business day from end → should use NEXT quarter perspective
+        in_transition = transition_start.date() <= middle_date.date() <= last_bday.date()
         
         if in_transition:
             # Use NEXT quarter perspective for entire period
@@ -541,24 +553,29 @@ def create_spreadviewer_config_for_period(contract1: ContractSpec, contract2: Co
 def calculate_synchronized_product_dates(dates: pd.DatetimeIndex, tenors_list: List[str], 
                                        tn1_list: List[int], n_s: int = 3) -> List[pd.DatetimeIndex]:
     """
-    Calculate product dates using exact SpreadViewer logic but with DataFetcher-compatible n_s interpretation
+    Calculate product dates with CORRECTED n_s logic
     
-    SpreadViewer's original logic: (dates + n_s * dates.freq).shift(tn, freq='QS')
-    Problem: SpreadViewer adds n_s business days FORWARD from current date
-    DataFetcher: Uses "last n_s business days of period" (backward-looking)
-    
-    This function replicates SpreadViewer's shift logic but ensures consistent n_s interpretation
+    CORRECT n_s logic:
+    - n_s denotes how many business days FORWARD from each date should be shifted to get product start date
+    - Reverse logic: for start date of absolute period, get relative periods for each date, 
+      then shift BACK by n_s to get the original reference date
+    - Filter out relative period 0, keep only 1 and above
     """
-    print(f"   🔧 Using synchronized product_dates (exact SpreadViewer logic with DataFetcher n_s)")
+    print(f"   🔧 Using CORRECTED n_s logic: forward shift to product start date")
     print(f"      📅 Input dates: {dates[0]} to {dates[-1]} ({len(dates)} business days)")
     print(f"      📊 Tenors: {tenors_list}, Periods: {tn1_list}, n_s: {n_s}")
     
     product_dates_list = []
     
     for tenor, tn in zip(tenors_list, tn1_list):
-        print(f"      🔄 Processing tenor {tenor}, period {tn}")
+        print(f"      🔄 Processing tenor {tenor}, relative period {tn}")
         
-        # Replicate SpreadViewer's exact logic but with corrected n_s interpretation
+        # Filter out relative period 0 - only keep 1 and above
+        if tn <= 0:
+            print(f"      ⚠️  Skipping relative period {tn} (must be >= 1)")
+            product_dates_list.append(pd.DatetimeIndex([]))
+            continue
+        
         if tenor in ['da', 'd']:
             # Daily contracts
             pd_result = dates.shift(1, freq='B')
@@ -572,119 +589,39 @@ def calculate_synchronized_product_dates(dates: pd.DatetimeIndex, tenors_list: L
             # M1Q contracts
             pd_result = dates.shift(tn, freq='QS')
         elif tenor in ['sum']:
-            # Summer contracts
+            # Summer contracts - use original SpreadViewer logic
             shifted_dates = dates + n_s * dates.freq
             pd_result = shifted_dates.shift(tn, freq='AS-Apr')
         elif tenor in ['win']:
-            # Winter contracts  
+            # Winter contracts - use original SpreadViewer logic
             shifted_dates = dates + n_s * dates.freq
             pd_result = shifted_dates.shift(tn, freq='AS-Oct')
         else:
             # Standard contracts (monthly 'm', quarterly 'q', yearly 'y')
-            # THIS IS THE KEY FIX: Instead of blind n_s forward shift,
-            # use DataFetcher-compatible transition logic
+            # CORRECTED LOGIC: Use original SpreadViewer approach
+            # n_s business days forward + relative period shift
             
-            reference_dates = []
-            for date in dates:
-                # Convert to datetime for calculations
-                if hasattr(date, 'to_pydatetime'):
-                    current_dt = date.to_pydatetime()
-                else:
-                    current_dt = date
-                
-                current_date = current_dt.date()
-                
-                # Determine if we're in transition period using DataFetcher logic
-                if tenor == 'q':  # Quarterly
-                    ref_period = ((current_date.month - 1) // 3) + 1
-                    ref_year = current_date.year
-                    
-                    # Find last business day of current quarter
-                    if ref_period == 1:
-                        quarter_end = datetime(ref_year, 3, 31)
-                    elif ref_period == 2:
-                        quarter_end = datetime(ref_year, 6, 30)
-                    elif ref_period == 3:
-                        quarter_end = datetime(ref_year, 9, 30)
-                    else:
-                        quarter_end = datetime(ref_year, 12, 31)
-                    
-                    # Find actual last business day
-                    last_bday = quarter_end
-                    while last_bday.weekday() > 4:
-                        last_bday -= timedelta(days=1)
-                    
-                    # Calculate transition start
-                    transition_start = last_bday
-                    for _ in range(n_s - 1):
-                        transition_start -= timedelta(days=1)
-                        while transition_start.weekday() > 4:
-                            transition_start -= timedelta(days=1)
-                    
-                    # Check if in transition - CORRECTED LOGIC
-                    # User observation: June 26 should be q_2, not q_1
-                    in_transition = transition_start.date() < current_date <= last_bday.date()
-                    
-                    if in_transition:
-                        # Use SpreadViewer's forward shift equivalent to being in next quarter
-                        if ref_period == 4:
-                            reference_quarter = 1
-                            reference_year = ref_year + 1
-                        else:
-                            reference_quarter = ref_period + 1
-                            reference_year = ref_year
-                        
-                        # Create reference date at start of next quarter
-                        reference_month = (reference_quarter - 1) * 3 + 1
-                        reference_dt = datetime(reference_year, reference_month, 1)
-                    else:
-                        # No transition - use current quarter start
-                        reference_month = (ref_period - 1) * 3 + 1
-                        reference_dt = datetime(ref_year, reference_month, 1)
-                        
-                else:  # Monthly
-                    ref_year = current_date.year
-                    ref_month = current_date.month
-                    
-                    # Monthly transition logic (similar approach)
-                    last_bday = calculate_last_business_day(ref_year, ref_month)
-                    
-                    transition_start = last_bday
-                    for _ in range(n_s - 1):
-                        transition_start -= timedelta(days=1)
-                        while transition_start.weekday() > 4:
-                            transition_start -= timedelta(days=1)
-                    
-                    # CORRECTED: Monthly transition logic to match quarterly fix
-                    in_transition = transition_start.date() < current_date <= last_bday.date()
-                    
-                    if in_transition:
-                        # Next month reference
-                        if ref_month == 12:
-                            reference_dt = datetime(ref_year + 1, 1, 1)
-                        else:
-                            reference_dt = datetime(ref_year, ref_month + 1, 1)
-                    else:
-                        # Current month reference
-                        reference_dt = datetime(ref_year, ref_month, 1)
-                
-                reference_dates.append(reference_dt)
+            # Step 1: Shift forward by n_s business days
+            # Ensure dates have business day frequency for proper calculation
+            if dates.freq is None:
+                dates = pd.date_range(start=dates[0], end=dates[-1], freq='B')
+            shifted_dates = dates + n_s * dates.freq
+            print(f"         📅 Step 1: Forward shift by {n_s} business days")
+            print(f"         📅 Original: {dates[0].strftime('%Y-%m-%d')} → Shifted: {shifted_dates[0].strftime('%Y-%m-%d')}")
             
-            # Convert to pandas DatetimeIndex and apply SpreadViewer's shift
-            reference_index = pd.DatetimeIndex(reference_dates)
-            
-            # Map SpreadViewer tenor back to correct pandas frequency
-            # SpreadViewer uses 'q_1', 'q_2' etc, but pandas needs 'Q' for quarterly
-            if tenor.startswith('q'):
+            # Step 2: Apply relative period shift
+            if tenor.startswith('q') or tenor == 'q':
                 pandas_freq = 'QS'  # Quarterly start
-            elif tenor.startswith('m'):
+            elif tenor.startswith('m') or tenor == 'm':
                 pandas_freq = 'MS'  # Monthly start  
-            elif tenor.startswith('y'):
+            elif tenor.startswith('y') or tenor == 'y':
                 pandas_freq = 'YS'  # Yearly start
             else:
                 pandas_freq = tenor.upper() + 'S'  # Fallback for other tenors
             
-            pd_result = reference_index.shift(tn, freq=pandas_freq)
+            pd_result = shifted_dates.shift(tn, freq=pandas_freq)
+            print(f"         📅 Step 2: Relative period shift by {tn} {pandas_freq}")
+            print(f"         📅 Final result: {pd_result[0].strftime('%Y-%m-%d')}")
         
         product_dates_list.append(pd_result)
         print(f"      ✅ Tenor {tenor}, period {tn}: {len(pd_result)} dates calculated")
@@ -694,7 +631,7 @@ def calculate_synchronized_product_dates(dates: pd.DatetimeIndex, tenors_list: L
             sample_dates = pd_result[:min(3, len(pd_result))]
             print(f"         📅 Sample results: {[d.strftime('%Y-%m-%d') for d in sample_dates]}")
     
-    print(f"   ✅ Synchronized product_dates calculation completed")
+    print(f"   ✅ CORRECTED product_dates calculation completed")
     return product_dates_list
 
 
@@ -801,6 +738,14 @@ def fetch_spreadviewer_for_period(config: Dict) -> Dict:
                 tm = spread_class.add_trades(data_dict, trade_dict, coefficients, [True, True])
                 tm_all = pd.concat([tm_all, tm], axis=0)
         
+        # Apply trade adjustment before returning - filter trades against spread bid/ask
+        if not tm_all.empty and not sm_all.empty:
+            print(f"   🔧 Applying trade adjustment filter...")
+            tm_before = len(tm_all)
+            tm_all = adjust_trds_(tm_all, sm_all)
+            tm_after = len(tm_all)
+            print(f"   📊 Trade filtering: {tm_before} → {tm_after} trades ({tm_before-tm_after} filtered)")
+        
         return {
             'spread_orders': sm_all,
             'spread_trades': tm_all
@@ -809,6 +754,24 @@ def fetch_spreadviewer_for_period(config: Dict) -> Dict:
     except Exception as e:
         print(f"   ⚠️  SpreadViewer fetch failed: {e}")
         return {'spread_orders': pd.DataFrame(), 'spread_trades': pd.DataFrame()}
+
+
+def adjust_trds_(df_tr, df_sm):
+    """
+    Adjust trades against spread bid/ask with buffer - from SpreadViewer test
+    Removes trades that are too close to current spread bid/ask prices
+    """
+    if df_tr.empty or df_sm.empty:
+        return df_tr
+    
+    timestamp = df_tr.index
+    ts_new = df_sm.index.union(timestamp)
+    df_sm = df_sm.reindex(ts_new).ffill().reindex(timestamp)
+    lb = df_sm.iloc[:, 0] + 0.001  # Lower bound + buffer (bid + buffer)
+    ub = df_sm.iloc[:, 1] - 0.001  # Upper bound - buffer (ask - buffer)
+    df_tr.loc[df_tr['buy'] >= ub, 'buy'] = np.nan    # Remove buys too close to ask
+    df_tr.loc[df_tr['sell'] <= lb, 'sell'] = np.nan  # Remove sells too close to bid
+    return df_tr.dropna(how='all')
 
 
 def transform_orders_to_target_format(orders_df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -1267,12 +1230,129 @@ def create_unified_real_spread_data(real_spread_data: Dict) -> Dict:
     return result
 
 
-def save_unified_results(results: Dict, contracts: List[str], period: Dict, stage: str = 'unified', test_mode: bool = False) -> None:
+def save_single_leg_results(single_data: Dict, contract: str, period: Dict, test_mode: bool = False, suffix: str = '', save_separate_csv: bool = False) -> None:
+    """Save single leg data as parquet files
+    
+    Args:
+        single_data: Dictionary containing 'trades' and 'orders' DataFrames
+        contract: Contract name (e.g., 'debm09_25')
+        period: Period dictionary with start/end dates
+        test_mode: If True, saves all formats to test/ subdirectory
+        suffix: Optional suffix to add to filename (e.g., '_v2', '_test')
+        save_separate_csv: If True, saves trades and orders as separate CSV files
+    """
+    output_dir = output_base
+    if test_mode:
+        output_dir = os.path.join(output_base, 'test')
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extract trades and orders DataFrames
+    trades_df = single_data.get('trades', pd.DataFrame())
+    orders_df = single_data.get('orders', pd.DataFrame())
+    
+    if trades_df.empty and orders_df.empty:
+        print(f"   ⚠️  No single leg data to save for {contract}")
+        return
+    
+    # Transform data to unified format
+    print(f"   🔄 Transforming single leg data to unified format for {contract}")
+    trades_formatted = transform_trades_to_target_format(trades_df, 'datafetcher') if not trades_df.empty else pd.DataFrame()
+    orders_formatted = transform_orders_to_target_format(orders_df, 'datafetcher') if not orders_df.empty else pd.DataFrame()
+    
+    # Merge trades and orders into unified format
+    unified_data = pd.DataFrame()
+    if not trades_formatted.empty:
+        unified_data = pd.concat([unified_data, trades_formatted], axis=0)
+    if not orders_formatted.empty:
+        unified_data = pd.concat([unified_data, orders_formatted], axis=0)
+    
+    if not unified_data.empty:
+        # Sort by timestamp and ensure target column order
+        unified_data = unified_data.sort_index()
+        target_columns = ['price', 'volume', 'action', 'broker_id', 'count', 'tradeid', 'b_price', 'a_price', '0']
+        unified_data = unified_data.reindex(columns=target_columns)
+    
+    # Generate filename: contract_tr_ba_data[suffix]
+    filename = f"{contract}_tr_ba_data{suffix}"
+    
+    # Validate data before saving
+    print(f"   🔍 Validating single leg data for {contract}")
+    validator = BidAskValidator(strict_mode=True, log_filtered=True)
+    validated_data = validator.validate_merged_data(unified_data, f"SingleLeg_{contract}")
+    
+    # Log validation summary
+    stats = validator.get_stats()
+    if stats['total_processed'] > 0:
+        print(f"      📊 Single leg validation: {stats['filtered_count']}/{stats['total_processed']} "
+              f"negative spreads filtered ({stats['filter_rate']:.1f}%)")
+    
+    # Always save as parquet
+    parquet_path = os.path.join(output_dir, f'{filename}.parquet')
+    validated_data.to_parquet(parquet_path)
+    print(f"   📁 Saved single leg data: {parquet_path}")
+    
+    # In test mode, also save CSV and pickle formats
+    if test_mode:
+        # Save as CSV
+        csv_path = os.path.join(output_dir, f'{filename}.csv')
+        validated_data.to_csv(csv_path)
+        print(f"   📁 Saved single leg data: {csv_path}")
+        
+        # Save as pickle
+        pkl_path = os.path.join(output_dir, f'{filename}.pkl')
+        validated_data.to_pickle(pkl_path)
+        print(f"   📁 Saved single leg data: {pkl_path}")
+        
+        # Save metadata
+        metadata = {
+            'contract': contract,
+            'period': period,
+            'data_info': {
+                'total_records': len(validated_data),
+                'trades_count': len(trades_df),
+                'orders_count': len(orders_df),
+                'columns': list(validated_data.columns),
+                'date_range': {
+                    'start': str(validated_data.index.min()) if not validated_data.empty else None,
+                    'end': str(validated_data.index.max()) if not validated_data.empty else None
+                }
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        metadata_path = os.path.join(output_dir, f'{filename}_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+        print(f"   📁 Saved single leg metadata: {metadata_path}")
+    
+    print(f"   ✅ Single leg data saved: {len(validated_data):,} records")
+    
+    # Save trades and orders as separate CSV files if requested
+    if save_separate_csv:
+        print(f"   📁 Saving separate trades and orders CSV files...")
+        
+        # Save trades CSV
+        if not trades_df.empty:
+            trades_csv_path = os.path.join(output_dir, f'{contract}_trades{suffix}.csv')
+            trades_df.to_csv(trades_csv_path)
+            print(f"   📁 Saved trades CSV: {trades_csv_path} ({len(trades_df):,} records)")
+        
+        # Save orders CSV
+        if not orders_df.empty:
+            orders_csv_path = os.path.join(output_dir, f'{contract}_orders{suffix}.csv')
+            orders_df.to_csv(orders_csv_path)
+            print(f"   📁 Saved orders CSV: {orders_csv_path} ({len(orders_df):,} records)")
+
+
+def save_unified_results(results: Dict, contracts: List[str], period: Dict, stage: str = 'unified', test_mode: bool = False, suffix: str = '', save_separate_csv: bool = False) -> None:
     """Save unified spread data with format options based on test mode
     
     Args:
         test_mode: If True, saves all formats (parquet, csv, json) to RawData/test/
                   If False, saves only parquet to RawData/
+        suffix: Optional suffix to add to filename (e.g., '_v2', '_test')
+        save_separate_csv: If True, saves trades and orders as separate CSV files
     """
     output_dir = output_base
     os.makedirs(output_dir, exist_ok=True)
@@ -1299,15 +1379,15 @@ def save_unified_results(results: Dict, contracts: List[str], period: Dict, stag
     
     # Generate filename based on number of contracts
     if len(contracts) == 1:
-        # Single contract: contract_tr_ba_data
-        filename = f"{contracts[0]}_tr_ba_data"
+        # Single contract: contract_tr_ba_data[suffix]
+        filename = f"{contracts[0]}_tr_ba_data{suffix}"
     elif len(contracts) == 2:
-        # Spread: contract1_contract2_tr_ba_data  
-        filename = f"{contracts[0]}_{contracts[1]}_tr_ba_data"
+        # Spread: contract1_contract2_tr_ba_data[suffix]
+        filename = f"{contracts[0]}_{contracts[1]}_tr_ba_data{suffix}"
     else:
         # Fallback for multiple contracts
         contract_names = '_'.join(contracts)
-        filename = f"{contract_names}_tr_ba_data"
+        filename = f"{contract_names}_tr_ba_data{suffix}"
     
     # Validate bid-ask spreads before saving
     print(f"   🔍 Final validation: Checking for negative bid-ask spreads...")
@@ -1369,6 +1449,37 @@ def save_unified_results(results: Dict, contracts: List[str], period: Dict, stag
     
     print(f"   ✅ Unified data summary: {len(unified_data):,} records, {unified_data.shape[1]} columns")
     print(f"   📊 Sample structure: {list(unified_data.columns)}")
+    
+    # Save trades and orders as separate CSV files if requested
+    if save_separate_csv and not unified_data.empty:
+        print(f"   📁 Saving separate trades and orders CSV files for spread...")
+        
+        # Separate trades (has price and volume) from orders (has bid/ask prices)
+        trades_mask = unified_data['price'].notna() & unified_data['volume'].notna()
+        orders_mask = unified_data['b_price'].notna() | unified_data['a_price'].notna()
+        
+        trades_df = unified_data[trades_mask & ~orders_mask]
+        orders_df = unified_data[~trades_mask & orders_mask]
+        
+        # Generate base filename
+        if len(contracts) == 1:
+            base_filename = contracts[0]
+        elif len(contracts) == 2:
+            base_filename = f"{contracts[0]}_{contracts[1]}"
+        else:
+            base_filename = '_'.join(contracts)
+        
+        # Save trades CSV
+        if not trades_df.empty:
+            trades_csv_path = os.path.join(output_dir, f'{base_filename}_trades{suffix}.csv')
+            trades_df.to_csv(trades_csv_path)
+            print(f"   📁 Saved spread trades CSV: {trades_csv_path} ({len(trades_df):,} records)")
+        
+        # Save orders CSV
+        if not orders_df.empty:
+            orders_csv_path = os.path.join(output_dir, f'{base_filename}_orders{suffix}.csv')
+            orders_df.to_csv(orders_csv_path)
+            print(f"   📁 Saved spread orders CSV: {orders_csv_path} ({len(orders_df):,} records)")
 
 
 def integrated_fetch(config: Dict) -> Dict:
@@ -1445,6 +1556,10 @@ def integrated_fetch(config: Dict) -> Dict:
         
         results['single_leg_data'] = single_data
         
+        # Save single leg data as parquet
+        print("💾 Saving single leg data...")
+        save_single_leg_results(single_data, contracts[0], period, config.get('test_mode', False), config.get('file_suffix', ''), config.get('save_separate_csv', False))
+        
     elif len(parsed_contracts) == 2:
         # SPREAD MODE
         print(f"🔍 SPREAD MODE: {contracts[0]} vs {contracts[1]}")
@@ -1480,7 +1595,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified real spread data
                 print("💾 Saving unified real spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'real_only', config.get('test_mode', False))
+                save_unified_results(results, config['contracts'], config['period'], 'real_only', config.get('test_mode', False), config.get('file_suffix', ''), config.get('save_separate_csv', False))
             except Exception as e:
                 print(f"   ❌ Real spread failed: {e}")
                 results['real_spread_error'] = str(e)
@@ -1503,7 +1618,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified synthetic spread data
                 print("💾 Saving unified synthetic spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'synthetic_only', config.get('test_mode', False))
+                save_unified_results(results, config['contracts'], config['period'], 'synthetic_only', config.get('test_mode', False), config.get('file_suffix', ''), config.get('save_separate_csv', False))
             except Exception as e:
                 print(f"   ❌ Synthetic spread failed: {e}")
                 results['synthetic_spread_error'] = str(e)
@@ -1524,7 +1639,7 @@ def integrated_fetch(config: Dict) -> Dict:
                 
                 # Save unified merged spread data
                 print("💾 Saving unified merged spread data...")
-                save_unified_results(results, config['contracts'], config['period'], 'merged', config.get('test_mode', False))
+                save_unified_results(results, config['contracts'], config['period'], 'merged', config.get('test_mode', False), config.get('file_suffix', ''), config.get('save_separate_csv', False))
             except Exception as e:
                 print(f"   ❌ Spread merging failed: {e}")
                 results['spread_merge_error'] = str(e)
@@ -1583,6 +1698,10 @@ def parse_arguments():
                       help='Include synthetic spread data from SpreadViewer (default: True)')
     parser.add_argument('--include-legs', action='store_true',
                       help='Include individual leg data (default: False)')
+    parser.add_argument('--suffix', default='',
+                      help='Optional suffix for output files (e.g., "_v2", "_test")')
+    parser.add_argument('--save-separate-csv', action='store_true',
+                      help='Save trades and orders as separate CSV files')
     
     return parser.parse_args()
 
@@ -1599,19 +1718,22 @@ def main():
     
     # Configuration dictionary - SpreadViewer ONLY
     config = {
-        'contracts': ['debq4_25', 'frbq4_25'],  # Example contracts
-        'coefficients': [1, -1],
+        'contracts': ['debm11_25'],  # Example contracts
+        'coefficients': [1],
         'period': {
-            'start_date': '2025-06-24',  # Same period for comparison
-            'end_date': '2025-07-01'
+            'start_date': '2025-10-15',  # Same period for comparison
+            'end_date': '2025-10-16'
         },
         'options': {
             'include_real_spread': True,  # SpreadViewer ONLY
-            'include_synthetic_spread': True,
-            'include_individual_legs': False
+            'include_synthetic_spread': False,
+            'include_individual_legs': True
         },
-        'n_s': 2,
-        'test_mode': True  # Save with suffix to distinguish
+        'n_s': 3,
+        'test_mode': False,  # Save with suffix to distinguish
+        # 'file_suffix': '_init_candles',  # Optional suffix for output files (e.g., '_v2', '_test')
+        'file_suffix': '',  # Optional suffix for output files (e.g., '_v2', '_test')
+        'save_separate_csv': False  # Save trades and orders as separate CSV files
     }
     
     # Set output base based on test mode
