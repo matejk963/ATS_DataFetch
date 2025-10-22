@@ -1,95 +1,35 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# RESTRICTIVE GITIGNORE: Only allow .py and .ipynb files
+# Ignore everything by default
+*
 
-# PyInstaller
-*.manifest
-*.spec
+# Allow Python files
+!*.py
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Allow Jupyter notebooks  
+!*.ipynb
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
+# Allow directories (needed for git to traverse)
+!*/
 
-# Virtual environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# Always ignore these sensitive/system files regardless
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.DS_Store
+**/Thumbs.db
+**/.env
+**/.venv
+**/env/
+**/venv/
+**/.idea/
+**/.vscode/
+**/*.log
+**/.ipynb_checkpoints/
+**/*.swp
+**/*.swo
+**/*~
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Data files
-*.csv
-*.json
-*.pkl
-*.parquet
-*.h5
-*.hdf5
-
-# Logs
-*.log
-logs/
-
-# Config files with sensitive data
-config.ini
-secrets.yaml
-.env.local
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
+# Git itself
+!.gitignore
+!.gitattributes
+!README.md
