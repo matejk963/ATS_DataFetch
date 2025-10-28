@@ -27,6 +27,7 @@ import argparse
 from datetime import datetime, time, timedelta
 import datetime as dt
 from typing import Dict, List, Tuple, Optional, Set
+from dateutil.relativedelta import relativedelta
 import pandas as pd
 import numpy as np
 import json
@@ -71,6 +72,98 @@ if SPREADVIEWER_AVAILABLE:
         SPREADVIEWER_AVAILABLE = False
 
 
+def calculate_contract_trading_end(contract_spec: ContractSpec) -> datetime:
+    """
+    Calculate when a contract stops trading based on its delivery date
+    
+    Args:
+        contract_spec: Parsed contract specification
+    
+    Returns:
+        datetime when trading ends
+    """
+    delivery_date = contract_spec.delivery_date
+    
+    # For monthly contracts, trading typically ends a few days before delivery
+    # For quarterly contracts, trading might end at the end of the last month of the quarter
+    if contract_spec.tenor == 'm':
+        # Monthly contracts: trading ends ~3 days before delivery month starts
+        trading_end = delivery_date - timedelta(days=3)
+    elif contract_spec.tenor == 'q':
+        # Quarterly contracts: trading ends at the end of the last month of the previous quarter
+        if delivery_date.month in [1, 2, 3]:  # Q1 delivery
+            trading_end = datetime(delivery_date.year - 1, 12, 31)
+        elif delivery_date.month in [4, 5, 6]:  # Q2 delivery  
+            trading_end = datetime(delivery_date.year, 3, 31)
+        elif delivery_date.month in [7, 8, 9]:  # Q3 delivery
+            trading_end = datetime(delivery_date.year, 6, 30)
+        else:  # Q4 delivery
+            trading_end = datetime(delivery_date.year, 9, 30)
+    else:
+        # Default: trading ends a few days before delivery
+        trading_end = delivery_date - timedelta(days=3)
+    
+    return trading_end
+
+
+def calculate_contract_trading_period(contract_spec: ContractSpec, months_back: int = 2) -> Dict[str, str]:
+    """
+    Calculate the last N months of trading for a contract ending at its delivery date
+    
+    Args:
+        contract_spec: Parsed contract specification
+        months_back: Number of months back from delivery date (default: 2)
+    
+    Returns:
+        Dict with 'start_date' and 'end_date' strings in 'YYYY-MM-DD' format
+    """
+    trading_end = calculate_contract_trading_end(contract_spec)
+    
+    # Calculate start date: N months back from trading end
+    trading_start = trading_end - relativedelta(months=months_back)
+    
+    return {
+        'start_date': trading_start.strftime('%Y-%m-%d'),
+        'end_date': trading_end.strftime('%Y-%m-%d')
+    }
+
+
+def calculate_spread_trading_period(contract1_spec: ContractSpec, contract2_spec: ContractSpec, months_back: int = 2) -> Dict[str, str]:
+    """
+    Calculate the trading period for a spread using conservative approach
+    
+    The spread can only be traded until the earliest contract stops trading.
+    
+    Args:
+        contract1_spec: First contract specification
+        contract2_spec: Second contract specification
+        months_back: Number of months back from earliest trading end (default: 2)
+    
+    Returns:
+        Dict with 'start_date' and 'end_date' strings in 'YYYY-MM-DD' format
+    """
+    # Get trading end dates for both contracts
+    trading_end1 = calculate_contract_trading_end(contract1_spec)
+    trading_end2 = calculate_contract_trading_end(contract2_spec)
+    
+    # Use the EARLIEST trading end (conservative approach)
+    spread_trading_end = min(trading_end1, trading_end2)
+    
+    # Calculate start date: N months back from spread trading end
+    spread_trading_start = spread_trading_end - relativedelta(months=months_back)
+    
+    print(f"   📅 SPREAD TRADING PERIOD CALCULATION:")
+    print(f"      Contract 1 ({contract1_spec.contract}) ends: {trading_end1.strftime('%Y-%m-%d')}")
+    print(f"      Contract 2 ({contract2_spec.contract}) ends: {trading_end2.strftime('%Y-%m-%d')}")
+    print(f"      Spread ends: {spread_trading_end.strftime('%Y-%m-%d')} (earliest)")
+    print(f"      Spread period: {spread_trading_start.strftime('%Y-%m-%d')} to {spread_trading_end.strftime('%Y-%m-%d')}")
+    
+    return {
+        'start_date': spread_trading_start.strftime('%Y-%m-%d'),
+        'end_date': spread_trading_end.strftime('%Y-%m-%d')
+    }
+
+
 @dataclass
 class SpreadCombination:
     """Represents a spread combination between two contracts"""
@@ -79,10 +172,20 @@ class SpreadCombination:
     parsed_contract1: ContractSpec
     parsed_contract2: ContractSpec
     coefficients: List[float] = None
+    trading_period: Dict[str, str] = None
+    trading_months_back: int = 2
     
     def __post_init__(self):
         if self.coefficients is None:
             self.coefficients = [1, -1]
+        
+        if self.trading_period is None:
+            # Calculate spread trading period using conservative approach
+            self.trading_period = calculate_spread_trading_period(
+                self.parsed_contract1, 
+                self.parsed_contract2, 
+                self.trading_months_back
+            )
     
     @property
     def spread_name(self) -> str:
@@ -91,7 +194,8 @@ class SpreadCombination:
 
 
 def generate_spread_combinations(contracts: List[str], 
-                               coefficients: Optional[List[float]] = None) -> List[SpreadCombination]:
+                               coefficients: Optional[List[float]] = None,
+                               trading_months_back: int = 2) -> List[SpreadCombination]:
     """
     Generate all possible spread combinations from a list of contracts
     
@@ -125,7 +229,8 @@ def generate_spread_combinations(contracts: List[str],
             contract2=contract2,
             parsed_contract1=parsed_contracts[contract1],
             parsed_contract2=parsed_contracts[contract2],
-            coefficients=coefficients or [1, -1]
+            coefficients=coefficients or [1, -1],
+            trading_months_back=trading_months_back
         )
         spread_combinations.append(combo)
         print(f"   📊 Spread: {combo.spread_name} (coefficients: {combo.coefficients})")
@@ -662,7 +767,8 @@ def fetch_synthetic_spread(combination: SpreadCombination,
 
 
 def fetch_all_spreads(contracts: List[str],
-                     period: Dict,
+                     period: Optional[Dict] = None,
+                     trading_months_back: int = 2,
                      use_real_spreads: bool = True,
                      use_synthetic_spreads: bool = True,
                      coefficients: Optional[List[float]] = None,
@@ -704,11 +810,14 @@ def fetch_all_spreads(contracts: List[str],
         dfe.output_base = output_base
     
     print(f"🚀 Fetching all spreads for {len(contracts)} contracts")
-    print(f"   📅 Period: {period['start_date']} to {period['end_date']}")
+    if period:
+        print(f"   📅 Period: {period['start_date']} to {period['end_date']} (fixed)")
+    else:
+        print(f"   📅 Period: Individual trading periods (last {trading_months_back} months per contract)")
     print(f"   🔧 Options: real={use_real_spreads}, synthetic={use_synthetic_spreads}, n_s={n_s}")
     
-    # Generate all spread combinations
-    combinations = generate_spread_combinations(contracts, coefficients)
+    # Generate all spread combinations with individual trading periods
+    combinations = generate_spread_combinations(contracts, coefficients, trading_months_back)
     
     # Results storage
     results = {
@@ -739,12 +848,44 @@ def fetch_all_spreads(contracts: List[str],
         
         # Fetch real spread if requested
         if use_real_spreads:
-            real_result = fetch_real_spread(combination, period, allowed_broker_ids)
+            real_result = fetch_real_spread(combination, combination.trading_period, allowed_broker_ids)
             spread_results['real_spread'] = real_result
         
         # Fetch synthetic spread if requested
         if use_synthetic_spreads:
-            synthetic_result = fetch_synthetic_spread(combination, period, n_s, clean_synthetic_outliers, use_absolute_contracts=False)
+            # Use the EXACT same approach as data_fetch_engine with individual trading periods
+            start_date = datetime.strptime(combination.trading_period['start_date'], '%Y-%m-%d')
+            end_date = datetime.strptime(combination.trading_period['end_date'], '%Y-%m-%d')
+            
+            synthetic_spread_data = fetch_synthetic_spread_multiple_periods(
+                combination.parsed_contract1, combination.parsed_contract2, 
+                start_date, end_date, combination.coefficients, n_s
+            )
+            
+            # Create unified DataFrame from synthetic data
+            unified_synthetic = create_unified_spreadviewer_data(synthetic_spread_data)
+            
+            synthetic_result = {
+                'spread_orders': synthetic_spread_data.get('spread_orders', pd.DataFrame()),
+                'spread_trades': synthetic_spread_data.get('spread_trades', pd.DataFrame()),
+                'unified_data': {'unified_spread_data': unified_synthetic.get('unified_spread_data', pd.DataFrame())},
+                'success': len(unified_synthetic.get('unified_spread_data', pd.DataFrame())) > 0,
+                'metadata': {
+                    'combination': f"{combination.contract1}_{combination.contract2}",
+                    'method': 'data_fetch_engine_multiple_periods',
+                    'coefficients': combination.coefficients,
+                    'n_s': n_s,
+                    'period': combination.trading_period
+                }
+            }
+            
+            # Apply outlier cleaning if requested
+            if clean_synthetic_outliers and len(synthetic_result['unified_data']['unified_spread_data']) > 0:
+                print(f"   🧹 Applying outlier cleaning to synthetic data...")
+                synthetic_result['unified_data']['unified_spread_data'] = clean_synthetic_spread_outliers(
+                    synthetic_result['unified_data']['unified_spread_data'], f"{combination.contract1}_{combination.contract2}"
+                )
+            
             spread_results['synthetic_spread'] = synthetic_result
         
         # Merge real and synthetic if both available
@@ -798,7 +939,7 @@ def fetch_all_spreads(contracts: List[str],
             # Prepare config for save function
             save_config = {
                 'contracts': [combination.contract1, combination.contract2],
-                'period': period,
+                'period': combination.trading_period,
                 'test_mode': test_mode,
                 'file_suffix': file_suffix,
                 'save_separate_csv': save_separate_csv
@@ -877,40 +1018,7 @@ def fetch_all_spreads(contracts: List[str],
     if use_real_spreads and use_synthetic_spreads:
         print(f"      Merged spreads success: {total_merged_success}/{len(combinations)}")
     
-    # Save summary if requested
-    if save_results:
-        summary_path = os.path.join(output_base, f'spread_fetch_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-        
-        # Convert DataFrames to summary info for JSON
-        json_results = {
-            'metadata': results['metadata'],
-            'summary': results['summary'],
-            'spreads': {}
-        }
-        
-        for spread_name, spread_data in results['spreads'].items():
-            json_results['spreads'][spread_name] = {
-                'combination': spread_data['combination']
-            }
-            
-            # Add success/error info for each spread type
-            for spread_type in ['real_spread', 'synthetic_spread', 'merged_spread']:
-                if spread_type in spread_data:
-                    json_results['spreads'][spread_name][spread_type] = {
-                        'success': spread_data[spread_type].get('success', False),
-                        'error': spread_data[spread_type].get('error')
-                    }
-                    
-                    # Add record counts if successful
-                    if spread_data[spread_type].get('success'):
-                        unified_data = spread_data[spread_type].get('unified_data', {}).get('unified_spread_data', pd.DataFrame())
-                        if not isinstance(unified_data, pd.DataFrame):
-                            unified_data = pd.DataFrame()
-                        json_results['spreads'][spread_name][spread_type]['record_count'] = len(unified_data)
-        
-        with open(summary_path, 'w') as f:
-            json.dump(json_results, f, indent=2, default=str)
-        print(f"\n📁 Summary saved: {summary_path}")
+    # Summary JSON saving disabled - only save parquet files
     
     return results
 
@@ -958,91 +1066,42 @@ def parse_arguments():
 
 def main():
     """Main function"""
-    print("🚀 Spread Fetch Engine")
-    print("=" * 70)
+    # Configuration - EDIT THESE VARIABLES AS NEEDED
+    config = {
+        'contracts': ['debm1_25', 'debm2_25', 'debm3_25', 'debm4_25', 'debm5_25', 'debm6_25',
+                      'debm7_25', 'debm8_25', 'debm9_25', 'debm10_25', 'debm11_25', 'debm12_25',
+                      'debq1_25', 'debq2_25', 'debq3_25', 'debq4_25',
+                      'frbm1_25', 'frbm2_25', 'frbm3_25', 'frbm4_25', 'frbm5_25', 'frbm6_25',
+                      'frbm7_25', 'frbm8_25', 'frbm9_25', 'frbm10_25', 'frbm11_25', 'frbm12_25',
+                      'frbq1_25', 'frbq2_25', 'frbq3_25', 'frbq4_25'],  # Change these contracts as needed
+        'period': None,  # Use individual trading periods per contract
+        'trading_months_back': 2,  # Number of months back from each contract's delivery date
+        'use_real_spreads': False,  # ONLY synthetic spreads
+        'use_synthetic_spreads': True,  # Clean synthetic spreads only
+        'coefficients': [1, -1],
+        'n_s': 3,
+        'allowed_broker_ids': [1441],
+        'save_results': True,
+        'test_mode': False,  # Save to test/ directory
+        'file_suffix': '_data_fetch_engine_method',
+        'save_separate_csv': False,
+        'clean_synthetic_outliers': True
+    }
     
-    # Parse command line arguments or use defaults
-    args = None
-    if len(sys.argv) > 1:
-        args = parse_arguments()
-        config = {
-            'contracts': args.contracts,
-            'period': {
-                'start_date': args.start_date,
-                'end_date': args.end_date
-            },
-            'use_real_spreads': args.use_real,
-            'use_synthetic_spreads': args.use_synthetic,
-            'coefficients': args.coefficients,
-            'n_s': args.n_s,
-            'allowed_broker_ids': args.broker_ids,
-            'save_results': not args.no_save,
-            'test_mode': args.test_mode,
-            'file_suffix': args.suffix,
-            'save_separate_csv': args.save_separate_csv,
-            'clean_synthetic_outliers': args.clean_synthetic_outliers
-        }
-    else:
-        # Default configuration for testing
-        config = {
-            'contracts': ['debm11_25', 'debq1_26'],  # 2 contracts for testing
-            'period': {
-                'start_date': '2025-09-01',
-                'end_date': '2025-09-05'  # Short test period
-            },
-            'use_real_spreads': False,  # ONLY synthetic spreads
-            'use_synthetic_spreads': True,  # Clean synthetic spreads only
-            'coefficients': [1, -1],
-            'n_s': 3,
-            'allowed_broker_ids': [1441],
-            'save_results': True,
-            'test_mode': False,  # Save to test/ directory
-            'file_suffix': '_synthetic_only_clean',
-            'save_separate_csv': False,
-            'clean_synthetic_outliers': True
-        }
-    
-    print(f"📋 Configuration:")
-    print(f"   Contracts: {config['contracts']} ({len(config['contracts'])} total)")
-    print(f"   Period: {config['period']['start_date']} to {config['period']['end_date']}")
-    print(f"   Real spreads: {config['use_real_spreads']}")
-    print(f"   Synthetic spreads: {config['use_synthetic_spreads']}")
-    print(f"   n_s: {config['n_s']}")
-    print(f"   Save results: {config['save_results']}")
-    if config['save_results']:
-        print(f"   Output mode: {'Test (all formats)' if config['test_mode'] else 'Production (parquet only)'}")
-    
-    # Check dependencies
-    print(f"\n🔍 Checking dependencies...")
+    # Check dependencies silently
     if not TPDATA_AVAILABLE:
-        print("❌ TPData not available - cannot fetch data")
         return False
-    else:
-        print("✅ TPData available")
     
     if not SPREADVIEWER_AVAILABLE:
-        print("⚠️  SpreadViewer not available - synthetic spreads disabled")
         config['use_synthetic_spreads'] = False
-    else:
-        print("✅ SpreadViewer available")
     
     # Execute spread fetching
     try:
         results = fetch_all_spreads(**config)
         return True
     except Exception as e:
-        print(f"\n❌ Spread fetch failed: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 
 if __name__ == "__main__":
-    success = main()
-    
-    if success:
-        print("\n🎉 SPREAD FETCH ENGINE COMPLETED SUCCESSFULLY!")
-    else:
-        print("\n💥 SPREAD FETCH ENGINE FAILED!")
-    
-    print("=" * 70)
+    main()
