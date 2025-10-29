@@ -1718,14 +1718,14 @@ def main():
     
     # Configuration dictionary - SpreadViewer ONLY
     config = {
-        'contracts': ['debq1_25'],  # Example contracts
-        'coefficients': [1],
+        'contracts': ['debm11_25', 'frbm11_25'],  # Example contracts
+        'coefficients': [1, -1],
         'period': {
-            'start_date': '2024-07-01',  # Same period for comparison
-            'end_date': '2024-12-31'
+            'start_date': '2025-09-01',  # Same period for comparison
+            'end_date': '2025-10-27'
         },
         'options': {
-            'include_real_spread': False,  # SpreadViewer ONLY
+            'include_real_spread': True,  # SpreadViewer ONLY
             'include_synthetic_spread': True,
             'include_individual_legs': True
         },

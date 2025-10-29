@@ -193,15 +193,148 @@ class SpreadCombination:
         return f"{self.contract1}_{self.contract2}"
 
 
+def is_valid_spread_combination(contract1_parsed: ContractSpec, contract2_parsed: ContractSpec) -> bool:
+    """
+    Check if two contracts form a valid spread combination based on sophisticated rules
+    
+    Rules:
+    1. Same periods (m/q/y): max difference of 2 periods (jan-mar, q3-q1, 2025-2027)
+    2. Month-Quarter: quarter with its months + preceding quarter months
+    3. Quarter-Year: all quarters of preceding year + first quarter of contract year
+    
+    Args:
+        contract1_parsed: First contract specification
+        contract2_parsed: Second contract specification
+        
+    Returns:
+        bool: True if valid combination
+    """
+    # Extract contract details
+    tenor1, year1 = contract1_parsed.tenor, contract1_parsed.delivery_date.year
+    tenor2, year2 = contract2_parsed.tenor, contract2_parsed.delivery_date.year
+    
+    # Extract period number from contract string (e.g., "1_25" -> 1, "12_24" -> 12)
+    try:
+        period1 = int(contract1_parsed.contract.split('_')[0])
+        period2 = int(contract2_parsed.contract.split('_')[0])
+    except (ValueError, IndexError):
+        # Fallback to month/quarter from delivery date
+        if tenor1 == 'm':
+            period1 = contract1_parsed.delivery_date.month
+        elif tenor1 == 'q':
+            period1 = ((contract1_parsed.delivery_date.month - 1) // 3) + 1
+        else:  # yearly
+            period1 = contract1_parsed.delivery_date.year % 100
+            
+        if tenor2 == 'm':
+            period2 = contract2_parsed.delivery_date.month
+        elif tenor2 == 'q':
+            period2 = ((contract2_parsed.delivery_date.month - 1) // 3) + 1
+        else:  # yearly
+            period2 = contract2_parsed.delivery_date.year % 100
+    
+    # Rule 1: Same tenor combinations
+    if tenor1 == tenor2:
+        if tenor1 == 'm':  # Monthly: max 2 months difference
+            month_diff = abs(period1 - period2)
+            if year1 == year2:
+                return month_diff <= 2
+            elif abs(year1 - year2) == 1:
+                # Cross-year: Dec-Jan, Dec-Feb allowed
+                if (period1 == 12 and period2 <= 2) or (period2 == 12 and period1 <= 2):
+                    return True
+            return False
+            
+        elif tenor1 == 'q':  # Quarterly: max 2 quarters difference
+            quarter_diff = abs(period1 - period2)
+            if year1 == year2:
+                return quarter_diff <= 2
+            elif abs(year1 - year2) == 1:
+                # Cross-year: Q4-Q1, Q4-Q2 allowed
+                if (period1 == 4 and period2 <= 2) or (period2 == 4 and period1 <= 2):
+                    return True
+            return False
+            
+        elif tenor1 == 'y':  # Yearly: max 2 years difference
+            return abs(year1 - year2) <= 2
+    
+    # Rule 2: Month-Quarter combinations
+    elif (tenor1 == 'm' and tenor2 == 'q') or (tenor1 == 'q' and tenor2 == 'm'):
+        month_tenor = contract1_parsed if tenor1 == 'm' else contract2_parsed
+        quarter_tenor = contract1_parsed if tenor1 == 'q' else contract2_parsed
+        
+        try:
+            month_num = int(month_tenor.contract.split('_')[0])
+            quarter_num = int(quarter_tenor.contract.split('_')[0])
+        except:
+            month_num = month_tenor.delivery_date.month
+            quarter_num = ((quarter_tenor.delivery_date.month - 1) // 3) + 1
+        month_year = month_tenor.delivery_date.year
+        quarter_year = quarter_tenor.delivery_date.year
+        
+        # Months within the quarter
+        quarter_months = {
+            1: [1, 2, 3],    # Q1: Jan, Feb, Mar
+            2: [4, 5, 6],    # Q2: Apr, May, Jun
+            3: [7, 8, 9],    # Q3: Jul, Aug, Sep
+            4: [10, 11, 12]  # Q4: Oct, Nov, Dec
+        }
+        
+        # Preceding quarter months
+        preceding_quarter = {
+            1: 4,  # Q1 preceded by Q4
+            2: 1,  # Q2 preceded by Q1
+            3: 2,  # Q3 preceded by Q2
+            4: 3   # Q4 preceded by Q3
+        }
+        
+        if month_year == quarter_year:
+            # Same year: month within quarter or within preceding quarter
+            valid_months = quarter_months[quarter_num]
+            if quarter_num > 1:
+                valid_months.extend(quarter_months[preceding_quarter[quarter_num]])
+            return month_num in valid_months
+            
+        elif quarter_num == 1 and month_year == quarter_year - 1:
+            # Q1 with months from Q4 of previous year
+            return month_num in quarter_months[4]  # Oct, Nov, Dec
+            
+    # Rule 3: Quarter-Year combinations
+    elif (tenor1 == 'q' and tenor2 == 'y') or (tenor1 == 'y' and tenor2 == 'q'):
+        quarter_tenor = contract1_parsed if tenor1 == 'q' else contract2_parsed
+        year_tenor = contract1_parsed if tenor1 == 'y' else contract2_parsed
+        
+        try:
+            quarter_num = int(quarter_tenor.contract.split('_')[0])
+        except:
+            quarter_num = ((quarter_tenor.delivery_date.month - 1) // 3) + 1
+        quarter_year = quarter_tenor.delivery_date.year
+        year_num = year_tenor.delivery_date.year
+        
+        # All quarters of preceding year + first quarter of contract year
+        if quarter_year == year_num - 1:
+            return True  # Any quarter from preceding year
+        elif quarter_year == year_num and quarter_num == 1:
+            return True  # First quarter of contract year
+            
+    return False
+
+
 def generate_spread_combinations(contracts: List[str], 
                                coefficients: Optional[List[float]] = None,
                                trading_months_back: int = 2) -> List[SpreadCombination]:
     """
-    Generate all possible spread combinations from a list of contracts
+    Generate sophisticated spread combinations based on period relationship rules
+    
+    Rules:
+    1. Same periods (m/q/y): max difference of 2 periods (jan-mar, q3-q1, 2025-2027)
+    2. Month-Quarter: quarter with its months + preceding quarter months  
+    3. Quarter-Year: all quarters of preceding year + first quarter of contract year
     
     Args:
         contracts: List of absolute contract names (e.g., ['debm07_25', 'debm08_25', 'debm09_25'])
         coefficients: Optional coefficients for spreads (default: [1, -1])
+        trading_months_back: Number of months back for trading period calculation
         
     Returns:
         List of SpreadCombination objects
@@ -209,33 +342,68 @@ def generate_spread_combinations(contracts: List[str],
     if len(contracts) < 2:
         raise ValueError("At least 2 contracts required for spread combinations")
     
-    print(f"🔄 Generating spread combinations from {len(contracts)} contracts...")
+    print(f"🔄 Generating sophisticated spread combinations from {len(contracts)} contracts...")
+    print(f"   📋 RULES:")
+    print(f"      • Same periods: max 2 period difference (jan-mar, q3-q1, 2025-2027)")
+    print(f"      • Month-Quarter: quarter months + preceding quarter months")
+    print(f"      • Quarter-Year: preceding year quarters + first quarter of year")
     
     # Parse all contracts first
     parsed_contracts = {}
     for contract in contracts:
         try:
             parsed_contracts[contract] = parse_absolute_contract(contract)
-            print(f"   ✅ Parsed {contract}: {parsed_contracts[contract].market}/{parsed_contracts[contract].product}/{parsed_contracts[contract].tenor}")
+            parsed = parsed_contracts[contract]
+            # Extract period for display
+            try:
+                period_num = int(parsed.contract.split('_')[0])
+            except:
+                period_num = parsed.delivery_date.month if parsed.tenor == 'm' else ((parsed.delivery_date.month - 1) // 3) + 1
+            print(f"   ✅ Parsed {contract}: {parsed.market}/{parsed.product}/{parsed.tenor}{period_num}_{parsed.delivery_date.year}")
         except Exception as e:
             print(f"   ❌ Failed to parse {contract}: {e}")
             raise
     
-    # Generate all 2-contract combinations
+    # Generate valid combinations based on sophisticated rules
     spread_combinations = []
-    for contract1, contract2 in combinations(contracts, 2):
-        combo = SpreadCombination(
-            contract1=contract1,
-            contract2=contract2,
-            parsed_contract1=parsed_contracts[contract1],
-            parsed_contract2=parsed_contracts[contract2],
-            coefficients=coefficients or [1, -1],
-            trading_months_back=trading_months_back
-        )
-        spread_combinations.append(combo)
-        print(f"   📊 Spread: {combo.spread_name} (coefficients: {combo.coefficients})")
+    total_possible = len(contracts) * (len(contracts) - 1) // 2
+    valid_count = 0
     
-    print(f"   ✅ Generated {len(spread_combinations)} spread combinations")
+    for contract1, contract2 in combinations(contracts, 2):
+        parsed1 = parsed_contracts[contract1]
+        parsed2 = parsed_contracts[contract2]
+        
+        if is_valid_spread_combination(parsed1, parsed2):
+            combo = SpreadCombination(
+                contract1=contract1,
+                contract2=contract2,
+                parsed_contract1=parsed1,
+                parsed_contract2=parsed2,
+                coefficients=coefficients or [1, -1],
+                trading_months_back=trading_months_back
+            )
+            spread_combinations.append(combo)
+            valid_count += 1
+            # Extract periods for display
+            try:
+                p1 = int(parsed1.contract.split('_')[0])
+                p2 = int(parsed2.contract.split('_')[0])
+            except:
+                p1 = parsed1.delivery_date.month if parsed1.tenor == 'm' else ((parsed1.delivery_date.month - 1) // 3) + 1
+                p2 = parsed2.delivery_date.month if parsed2.tenor == 'm' else ((parsed2.delivery_date.month - 1) // 3) + 1
+            print(f"   ✅ Valid spread: {combo.spread_name} ({parsed1.tenor}{p1}_{parsed1.delivery_date.year} vs {parsed2.tenor}{p2}_{parsed2.delivery_date.year})")
+        else:
+            # Extract periods for display
+            try:
+                p1 = int(parsed1.contract.split('_')[0])
+                p2 = int(parsed2.contract.split('_')[0])
+            except:
+                p1 = parsed1.delivery_date.month if parsed1.tenor == 'm' else ((parsed1.delivery_date.month - 1) // 3) + 1
+                p2 = parsed2.delivery_date.month if parsed2.tenor == 'm' else ((parsed2.delivery_date.month - 1) // 3) + 1
+            print(f"   ❌ Invalid: {contract1} vs {contract2} ({parsed1.tenor}{p1}_{parsed1.delivery_date.year} vs {parsed2.tenor}{p2}_{parsed2.delivery_date.year})")
+    
+    print(f"   📊 SUMMARY: {valid_count}/{total_possible} combinations valid ({100*valid_count/total_possible:.1f}%)")
+    print(f"   ✅ Generated {len(spread_combinations)} sophisticated spread combinations")
     return spread_combinations
 
 
@@ -1068,6 +1236,7 @@ def main():
     """Main function"""
     # Configuration - EDIT THESE VARIABLES AS NEEDED
     config = {
+        # 'contracts': ['debm1_25', 'debq3_25'],
         'contracts': ['debm1_25', 'debm2_25', 'debm3_25', 'debm4_25', 'debm5_25', 'debm6_25',
                       'debm7_25', 'debm8_25', 'debm9_25', 'debm10_25', 'debm11_25', 'debm12_25',
                       'debq1_25', 'debq2_25', 'debq3_25', 'debq4_25',
@@ -1076,7 +1245,7 @@ def main():
                       'frbq1_25', 'frbq2_25', 'frbq3_25', 'frbq4_25'],  # Change these contracts as needed
         'period': None,  # Use individual trading periods per contract
         'trading_months_back': 2,  # Number of months back from each contract's delivery date
-        'use_real_spreads': False,  # ONLY synthetic spreads
+        'use_real_spreads': True,  # ONLY synthetic spreads
         'use_synthetic_spreads': True,  # Clean synthetic spreads only
         'coefficients': [1, -1],
         'n_s': 3,
