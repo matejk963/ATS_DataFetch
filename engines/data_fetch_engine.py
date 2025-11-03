@@ -204,14 +204,31 @@ def parse_absolute_contract(contract_str: str) -> ContractSpec:
         raise ValueError(f"Invalid contract format: {contract_str}")
     
     # Known 3-letter market codes
-    three_letter_markets = {'ttf', 'nbp', 'peg', 'zee', 'gas'}
+    three_letter_markets = {'ttf', 'nbp', 'peg', 'zee', 'gas', 'eua'}
     
     # Try 3-letter market code first
     if len(contract_str) >= 7 and contract_str[:3].lower() in three_letter_markets:
-        market = contract_str[:3].lower()       # 'ttf'
-        product_code = contract_str[3:4]        # 'b' or 'p'
-        tenor = contract_str[4:5]              # 'm'
-        contract = contract_str[5:]            # '09_25'
+        market = contract_str[:3].lower()       # 'ttf' or 'eua'
+        
+        # EUA contracts have special format: euay1_25 (eua + y + 1_25)
+        # EUA doesn't have product codes - they're always allowances
+        if market == 'eua':
+            if len(contract_str) >= 7:  # euay1_25 minimum (7 chars)
+                # For EUA, we expect: eua + y + 1_25 
+                # So positions are: 0-2=eua, 3=y, 4+=1_25
+                if contract_str[3:4] != 'y':
+                    raise ValueError(f"EUA contracts must have 'y' tenor, got: {contract_str[3:4]}")
+                    
+                product_code = 'a'                    # Always 'a' for allowance (implicit)
+                tenor = 'y'                          # Always 'y' for yearly 
+                contract = contract_str[4:]          # '1_25'
+            else:
+                raise ValueError(f"Invalid EUA contract format: {contract_str} (too short, expected euay1_25 format)")
+        else:
+            # Standard 3-letter market format
+            product_code = contract_str[3:4]        # 'b', 'p'
+            tenor = contract_str[4:5]              # 'm'
+            contract = contract_str[5:]            # '09_25'
     else:
         # Default to 2-letter market code
         market = contract_str[:2].lower()       # 'de'
@@ -219,9 +236,14 @@ def parse_absolute_contract(contract_str: str) -> ContractSpec:
         tenor = contract_str[3:4]              # 'm'
         contract = contract_str[4:]            # '09_25'
     
-    product_map = {'b': 'base', 'p': 'peak'}
+    # EUA contracts have special handling - no product distinction
+    if market == 'eua':
+        product_map = {'a': 'allowance'}  # EUA specific
+    else:
+        product_map = {'b': 'base', 'p': 'peak'}  # Energy contracts
+    
     if product_code not in product_map:
-        raise ValueError(f"Unknown product code: {product_code}")
+        raise ValueError(f"Unknown product code: {product_code} for market: {market}")
     
     product = product_map[product_code]
     
@@ -308,6 +330,55 @@ def calculate_transition_dates(start_date: datetime, end_date: datetime, n_s: in
     return periods
 
 
+def calculate_eua_relative_offset(reference_date: datetime, 
+                                 contract_spec: ContractSpec, 
+                                 n_s: int = 3,
+                                 use_next_year: bool = False) -> int:
+    """
+    Calculate EUA relative offset with Dec 1st transition logic
+    
+    EUA contracts shift around December 1st:
+    - Dec 1, 2024 → Nov 30, 2025: euay1_25 is front Dec
+    - Dec 1, 2025 → Nov 30, 2026: euay1_26 is front Dec
+    
+    Args:
+        reference_date: The reference date for calculation
+        contract_spec: Contract specification with delivery date
+        n_s: Business day transition parameter (not used for EUA, kept for compatibility)
+        use_next_year: If True, use next year perspective
+        
+    Returns:
+        int: Relative offset (for dec_X notation)
+    """
+    ref_year = reference_date.year
+    
+    # Determine which "EUA year" we're in based on Dec 1st boundaries
+    # If we're before Dec 1st, we're still in the previous EUA year
+    if reference_date.month < 12:
+        eua_year = ref_year
+    else:
+        # December - check if we're before Dec 1st transition
+        if reference_date.day < 1:
+            eua_year = ref_year
+        else:
+            # On or after Dec 1st - we're in the next EUA year
+            eua_year = ref_year + 1
+    
+    # Apply next year perspective if in transition
+    if use_next_year:
+        calc_year = eua_year + 1
+    else:
+        calc_year = eua_year
+    
+    # Get delivery year from contract
+    delivery_year = contract_spec.delivery_date.year
+    
+    # Calculate relative offset (years difference)
+    relative_offset = delivery_year - calc_year
+    
+    return relative_offset
+
+
 def calculate_quarterly_relative_offset(reference_date: datetime, 
                                        contract_spec: ContractSpec, 
                                        n_s: int = 3,
@@ -366,8 +437,98 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
     """
     periods = []
     
+    # Handle EUA contracts with Dec 1st transition logic
+    if contract_spec.market == 'eua':
+        print(f"🔧 Using EUA transition logic for {contract_spec.contract}")
+        
+        # Find all Dec 1st transitions within the period
+        eua_transitions = []
+        
+        # Check each year from start to end
+        current_year = start_date.year
+        while current_year <= end_date.year + 1:
+            # Dec 1st transition date
+            dec_1_date = datetime(current_year, 12, 1)
+            
+            # Check if transition overlaps with our period
+            if (dec_1_date.date() <= end_date.date() and 
+                dec_1_date.date() >= start_date.date()):
+                eua_transitions.append(dec_1_date)
+            
+            current_year += 1
+        
+        # If we have transitions within the period, split it
+        if eua_transitions:
+            print(f"🔧 Found {len(eua_transitions)} EUA transitions in period")
+            
+            # Sort transitions by date
+            eua_transitions.sort()
+            
+            period_start = start_date
+            for transition_date in eua_transitions:
+                # Period before transition
+                if period_start < transition_date:
+                    pre_end = transition_date - timedelta(seconds=1)
+                    relative_offset = calculate_eua_relative_offset(
+                        pre_end, contract_spec, n_s, use_next_year=False
+                    )
+                    
+                    pre_rel_period = RelativePeriod(
+                        relative_offset=relative_offset,
+                        start_date=period_start,
+                        end_date=pre_end
+                    )
+                    periods.append((pre_rel_period, period_start, pre_end))
+                    print(f"   📊 Pre-transition: dec_{relative_offset} ({period_start.strftime('%Y-%m-%d')} to {pre_end.strftime('%Y-%m-%d')})")
+                
+                # Transition period (on/after Dec 1st)
+                trans_start = max(transition_date, period_start)
+                trans_end = min(end_date, transition_date + timedelta(days=365))  # Rest of EUA year
+                
+                if trans_start <= trans_end and trans_start <= end_date:
+                    relative_offset = calculate_eua_relative_offset(
+                        trans_start, contract_spec, n_s, use_next_year=True
+                    )
+                    
+                    trans_rel_period = RelativePeriod(
+                        relative_offset=relative_offset,
+                        start_date=trans_start,
+                        end_date=min(trans_end, end_date)
+                    )
+                    periods.append((trans_rel_period, trans_start, min(trans_end, end_date)))
+                    print(f"   📊 Post-transition: dec_{relative_offset} ({trans_start.strftime('%Y-%m-%d')} to {min(trans_end, end_date).strftime('%Y-%m-%d')})")
+                
+                period_start = transition_date + timedelta(seconds=1)
+            
+            return periods
+        
+        # No transitions in period - use single period calculation
+        middle_date = start_date + (end_date - start_date) / 2
+        
+        # Check if middle date is in transition period (around Dec 1st)
+        dec_1_date = datetime(middle_date.year, 12, 1)
+        in_transition = abs((middle_date - dec_1_date).days) <= 3  # 3-day transition window
+        
+        # Calculate relative offset using helper function
+        relative_offset = calculate_eua_relative_offset(
+            middle_date, contract_spec, n_s, use_next_year=in_transition
+        )
+        
+        print(f"   📅 Contract: {contract_spec.contract} (EUA {contract_spec.delivery_date.year})")
+        print(f"   📊 Reference date: {middle_date.strftime('%Y-%m-%d')} (transition: {in_transition})")
+        print(f"   📊 Relative offset: {relative_offset} (dec_{relative_offset})")
+        
+        if relative_offset >= 0:
+            # Create single consistent period for entire date range
+            relative_period = RelativePeriod(
+                relative_offset=relative_offset,
+                start_date=start_date,
+                end_date=end_date
+            )
+            periods.append((relative_period, start_date, end_date))
+    
     # For quarterly contracts, use quarterly-based transition logic instead of monthly
-    if contract_spec.tenor == 'q':
+    elif contract_spec.tenor == 'q':
         print(f"🔧 Using QUARTERLY transition logic for {contract_spec.contract}")
         
         # Find all quarter transitions within the period
@@ -634,9 +795,23 @@ def create_spreadviewer_config_for_period(contract1: ContractSpec, contract2: Co
                                         start_date: datetime, end_date: datetime,
                                         coefficients: List[float], n_s: int) -> Dict:
     """Create SpreadViewer configuration for specific relative period"""
+    
+    # Translate EUA tenors for SpreadViewer
+    def translate_tenor_for_spreadviewer(market: str, tenor: str) -> str:
+        """Translate tenor for SpreadViewer - EUA 'y' becomes 'dec'"""
+        if market == 'eua' and tenor == 'y':
+            return 'dec'
+        return tenor
+    
+    tenor1 = translate_tenor_for_spreadviewer(contract1.market, contract1.tenor)
+    tenor2 = translate_tenor_for_spreadviewer(contract2.market, contract2.tenor)
+    
+    if tenor1 != contract1.tenor or tenor2 != contract2.tenor:
+        print(f"🔧 EUA tenor translation: {contract1.market}:{contract1.tenor}→{tenor1}, {contract2.market}:{contract2.tenor}→{tenor2}")
+    
     return {
         'markets': [contract1.market, contract2.market],
-        'tenors': [contract1.tenor, contract2.tenor],
+        'tenors': [tenor1, tenor2],
         'tn1_list': [rel_period1.relative_offset, rel_period2.relative_offset],
         'tn2_list': [],
         'coefficients': coefficients,
@@ -1636,10 +1811,19 @@ def integrated_fetch(config: Dict) -> Dict:
         # Use DataFetcher for individual contract
         fetcher = DataFetcher(allowed_broker_ids=[1441])
         
+        # Translate tenor for data fetching (EUA y→dec)
+        def translate_tenor_for_datafetch(market: str, tenor: str) -> str:
+            """Translate tenor for data fetching - EUA 'y' becomes 'dec'"""
+            if market == 'eua' and tenor == 'y':
+                return 'dec'
+            return tenor
+        
+        fetching_tenor = translate_tenor_for_datafetch(contract.market, contract.tenor)
+        
         # Create contract config for DataFetcher
         contract_config = {
             'market': contract.market,
-            'tenor': contract.tenor,
+            'tenor': fetching_tenor,  # Use translated tenor
             'contract': contract.contract,
             'start_date': period['start_date'],
             'end_date': period['end_date'],
@@ -1816,15 +2000,15 @@ def main():
     
     # Configuration dictionary - SpreadViewer ONLY
     config = {
-        'contracts': ['debq2_25', 'frbq2_25'],  # Example contracts
+        'contracts': ['euay1_25'],  # Example contracts
         'coefficients': [1, -1],
         'period': {
             'start_date': '2024-09-01',  # Same period for comparison
             'end_date': '2025-03-31'
         },
         'options': {
-            'include_real_spread': False,  # SpreadViewer ONLY
-            'include_synthetic_spread': True,
+            'include_real_spread': True,  # SpreadViewer ONLY
+            'include_synthetic_spread': False,
             'include_individual_legs': True
         },
         'n_s': 3,

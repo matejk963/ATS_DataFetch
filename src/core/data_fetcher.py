@@ -173,6 +173,12 @@ class DeliveryDateCalculator:
             year = base_year + int(contract) if int(contract) < 50 else 1900 + int(contract)
             return datetime(year, 1, 1)
         
+        elif tenor.lower() == 'dec':
+            # EUA December delivery: contract is year_YY format (e.g., '1_25' for Dec 2025)
+            year_str = contract.split('_')[1]  # Get '25' from '1_25'
+            year = base_year + int(year_str) if int(year_str) < 50 else 1900 + int(year_str)
+            return datetime(year, 12, 1)  # December 1st delivery
+        
         else:
             raise ValueError(f"Unknown tenor: {tenor}")
 
@@ -253,6 +259,11 @@ class ContractValidator:
         
         # Check tenor is valid
         valid_tenors = ['da', 'd', 'w', 'm', 'q', 'y']
+        
+        # EUA contracts can use 'dec' tenor
+        if contract_config['market'] == 'eua':
+            valid_tenors = valid_tenors + ['dec']
+            
         if contract_config['tenor'] not in valid_tenors:
             raise ValueError(f"Invalid tenor: {contract_config['tenor']}")
         
