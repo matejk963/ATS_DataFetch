@@ -308,6 +308,50 @@ def calculate_transition_dates(start_date: datetime, end_date: datetime, n_s: in
     return periods
 
 
+def calculate_quarterly_relative_offset(reference_date: datetime, 
+                                       contract_spec: ContractSpec, 
+                                       n_s: int = 3,
+                                       use_next_quarter: bool = False) -> int:
+    """
+    Calculate quarterly relative offset from reference date to contract delivery
+    
+    Args:
+        reference_date: The reference date for calculation
+        contract_spec: Contract specification with delivery date
+        n_s: Business day transition parameter (not used for quarterly, kept for compatibility)
+        use_next_quarter: If True, use next quarter perspective
+        
+    Returns:
+        int: Relative offset (for q_X notation)
+    """
+    # Get reference quarter and year
+    ref_quarter = ((reference_date.month - 1) // 3) + 1
+    ref_year = reference_date.year
+    
+    # Apply next quarter perspective if in transition
+    if use_next_quarter:
+        if ref_quarter == 4:
+            calc_quarter = 1
+            calc_year = ref_year + 1
+        else:
+            calc_quarter = ref_quarter + 1
+            calc_year = ref_year
+    else:
+        calc_quarter = ref_quarter
+        calc_year = ref_year
+    
+    # Get delivery quarter and year
+    delivery_quarter = ((contract_spec.delivery_date.month - 1) // 3) + 1
+    delivery_year = contract_spec.delivery_date.year
+    
+    # Calculate relative offset
+    calc_quarters = calc_year * 4 + (calc_quarter - 1)
+    delivery_quarters = delivery_year * 4 + (delivery_quarter - 1)
+    relative_offset = delivery_quarters - calc_quarters
+    
+    return relative_offset
+
+
 def convert_absolute_to_relative_periods(contract_spec: ContractSpec, 
                                        start_date: datetime, 
                                        end_date: datetime,
@@ -324,51 +368,117 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
     
     # For quarterly contracts, use quarterly-based transition logic instead of monthly
     if contract_spec.tenor == 'q':
-        print(f"🔧 Using CONSISTENT quarterly transition logic for {contract_spec.contract}")
+        print(f"🔧 Using QUARTERLY transition logic for {contract_spec.contract}")
         
-        # CORRECTED: Transition happens AT June 26th (3rd business day from end)
-        # Both June 26th and June 27th should be q_1
-        transition_date = datetime(2025, 6, 26)  # Transition happens AT June 26
+        # Find all quarter transitions within the period
+        quarter_transitions = []
         
-        if start_date < transition_date <= end_date:
-            # Period spans transition - split into pre and post transition periods
-            print(f"🔧 Period spans transition at {transition_date.strftime('%Y-%m-%d')} - splitting periods")
+        # Check each quarter from start to end
+        current_date = start_date.replace(day=1)
+        while current_date <= end_date:
+            quarter = ((current_date.month - 1) // 3) + 1
+            year = current_date.year
             
-            # Pre-transition period (should use q_2)
-            if start_date < transition_date:
-                pre_end = transition_date - timedelta(days=1)
-                pre_end = pre_end.replace(hour=23, minute=59, second=59)
+            # Get quarter end date
+            if quarter == 1:
+                quarter_end = datetime(year, 3, 31)
+            elif quarter == 2:
+                quarter_end = datetime(year, 6, 30)
+            elif quarter == 3:
+                quarter_end = datetime(year, 9, 30)
+            else:  # Q4
+                quarter_end = datetime(year, 12, 31)
+            
+            # Calculate transition start (n_s business days before quarter end)
+            last_bday = quarter_end
+            while last_bday.weekday() > 4:
+                last_bday -= timedelta(days=1)
+            
+            transition_start = last_bday
+            for _ in range(n_s - 1):
+                transition_start -= timedelta(days=1)
+                while transition_start.weekday() > 4:
+                    transition_start -= timedelta(days=1)
+            
+            # Check if transition overlaps with our period
+            if (transition_start.date() <= end_date.date() and 
+                last_bday.date() >= start_date.date()):
+                quarter_transitions.append((transition_start, last_bday, quarter, year))
+            
+            # Move to next quarter
+            if quarter == 4:
+                current_date = datetime(year + 1, 1, 1)
+            else:
+                next_quarter_month = quarter * 3 + 1
+                current_date = datetime(year, next_quarter_month, 1)
+        
+        # If we have transitions within the period, split it
+        if quarter_transitions:
+            print(f"🔧 Found {len(quarter_transitions)} quarter transitions in period")
+            
+            # Sort transitions by date
+            quarter_transitions.sort()
+            
+            period_start = start_date
+            for transition_start, transition_end, quarter, year in quarter_transitions:
+                # Period before transition
+                if period_start < transition_start:
+                    pre_end = transition_start - timedelta(seconds=1)
+                    relative_offset = calculate_quarterly_relative_offset(
+                        pre_end, contract_spec, n_s, use_next_quarter=False
+                    )
+                    
+                    pre_rel_period = RelativePeriod(
+                        relative_offset=relative_offset,
+                        start_date=period_start,
+                        end_date=pre_end
+                    )
+                    periods.append((pre_rel_period, period_start, pre_end))
+                    print(f"   📊 Pre-transition: q_{relative_offset} ({period_start.strftime('%Y-%m-%d')} to {pre_end.strftime('%Y-%m-%d')})")
                 
-                pre_rel_period = RelativePeriod(
-                    relative_offset=2,  # Q2 perspective: Q4 delivery = 2 quarters ahead
-                    start_date=start_date,
-                    end_date=pre_end
-                )
-                periods.append((pre_rel_period, start_date, pre_end))
-                print(f"   📊 Pre-transition: q_2 ({start_date.strftime('%Y-%m-%d')} to {pre_end.strftime('%Y-%m-%d')})")
+                # Transition period
+                trans_start = max(transition_start, period_start)
+                trans_end = min(transition_end, end_date)
+                
+                if trans_start <= trans_end:
+                    relative_offset = calculate_quarterly_relative_offset(
+                        trans_start, contract_spec, n_s, use_next_quarter=True
+                    )
+                    
+                    trans_rel_period = RelativePeriod(
+                        relative_offset=relative_offset,
+                        start_date=trans_start,
+                        end_date=trans_end
+                    )
+                    periods.append((trans_rel_period, trans_start, trans_end))
+                    print(f"   📊 Transition: q_{relative_offset} ({trans_start.strftime('%Y-%m-%d')} to {trans_end.strftime('%Y-%m-%d')})")
+                
+                period_start = transition_end + timedelta(seconds=1)
             
-            # Post-transition period (should use q_1)  
-            if transition_date <= end_date:
-                post_start = transition_date.replace(hour=0, minute=0, second=0)
+            # Period after last transition
+            if period_start <= end_date:
+                relative_offset = calculate_quarterly_relative_offset(
+                    period_start, contract_spec, n_s, use_next_quarter=False
+                )
                 
                 post_rel_period = RelativePeriod(
-                    relative_offset=1,  # Q3 perspective: Q4 delivery = 1 quarter ahead
-                    start_date=post_start,
+                    relative_offset=relative_offset,
+                    start_date=period_start,
                     end_date=end_date
                 )
-                periods.append((post_rel_period, post_start, end_date))
-                print(f"   📊 Post-transition: q_1 ({post_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
-                
+                periods.append((post_rel_period, period_start, end_date))
+                print(f"   📊 Post-transition: q_{relative_offset} ({period_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
+            
             return periods
         
-        # Period doesn't span transition - use original logic with middle date
+        # No transitions in period - use single period calculation
         middle_date = start_date + (end_date - start_date) / 2
         
-        # Get reference quarter for middle date
+        # Check if middle date is in quarter transition period
         ref_quarter = ((middle_date.month - 1) // 3) + 1
         ref_year = middle_date.year
         
-        # Check if middle date is in transition using DataFetcher logic
+        # Get quarter end date
         if ref_quarter == 1:
             quarter_end = datetime(ref_year, 3, 31)
         elif ref_quarter == 2:
@@ -378,45 +488,27 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
         else:  # Q4
             quarter_end = datetime(ref_year, 12, 31)
         
-        # Find last business day of quarter
+        # Calculate transition period
         last_bday = quarter_end
         while last_bday.weekday() > 4:
             last_bday -= timedelta(days=1)
         
-        # Calculate transition start
         transition_start = last_bday
         for _ in range(n_s - 1):
             transition_start -= timedelta(days=1)
             while transition_start.weekday() > 4:
                 transition_start -= timedelta(days=1)
         
-        # Check if middle date is in transition - CORRECTED LOGIC
-        # User observation: June 26 should be q_1 when n_s=3
-        # June 26 = 3rd business day from end → should use NEXT quarter perspective
+        # Check if in transition
         in_transition = transition_start.date() <= middle_date.date() <= last_bday.date()
         
-        if in_transition:
-            # Use NEXT quarter perspective for entire period
-            if ref_quarter == 4:
-                calc_quarter = 1
-                calc_year = ref_year + 1
-            else:
-                calc_quarter = ref_quarter + 1
-                calc_year = ref_year
-        else:
-            # Use CURRENT quarter perspective for entire period
-            calc_quarter = ref_quarter
-            calc_year = ref_year
+        # Calculate relative offset using helper function
+        relative_offset = calculate_quarterly_relative_offset(
+            middle_date, contract_spec, n_s, use_next_quarter=in_transition
+        )
         
-        # Calculate relative offset using consistent reference
-        delivery_quarter = ((contract_spec.delivery_date.month - 1) // 3) + 1
-        
-        calc_quarters = calc_year * 4 + (calc_quarter - 1)
-        delivery_quarters = contract_spec.delivery_date.year * 4 + (delivery_quarter - 1)
-        relative_offset = delivery_quarters - calc_quarters
-        
-        print(f"   📅 Contract: {contract_spec.contract} (Q{delivery_quarter} {contract_spec.delivery_date.year})")
-        print(f"   📊 Reference perspective: Q{calc_quarter} {calc_year} (transition: {in_transition})")
+        print(f"   📅 Contract: {contract_spec.contract} (Q{((contract_spec.delivery_date.month - 1) // 3) + 1} {contract_spec.delivery_date.year})")
+        print(f"   📊 Reference date: {middle_date.strftime('%Y-%m-%d')} (Q{ref_quarter} {ref_year}, transition: {in_transition})")
         print(f"   📊 Relative offset: {relative_offset} (q_{relative_offset})")
         
         if relative_offset > 0:
@@ -444,10 +536,16 @@ def convert_absolute_to_relative_periods(contract_spec: ContractSpec,
                 # Early month period: count from current month's perspective
                 ref_year, ref_month = period_start.year, period_start.month
             
-            # Calculate month difference for monthly/yearly contracts
-            months_diff = ((contract_spec.delivery_date.year - ref_year) * 12 + 
-                          (contract_spec.delivery_date.month - ref_month))
-            relative_offset = months_diff
+            # Calculate relative offset based on contract tenor
+            if contract_spec.tenor == 'y':
+                # For yearly contracts: calculate year difference
+                years_diff = contract_spec.delivery_date.year - ref_year
+                relative_offset = years_diff
+            else:
+                # For monthly contracts: calculate month difference
+                months_diff = ((contract_spec.delivery_date.year - ref_year) * 12 + 
+                              (contract_spec.delivery_date.month - ref_month))
+                relative_offset = months_diff
             
             if relative_offset > 0:  # Only include future contracts
                 relative_period = RelativePeriod(
@@ -1718,14 +1816,14 @@ def main():
     
     # Configuration dictionary - SpreadViewer ONLY
     config = {
-        'contracts': ['debm11_25', 'frbm11_25'],  # Example contracts
+        'contracts': ['debq2_25', 'frbq2_25'],  # Example contracts
         'coefficients': [1, -1],
         'period': {
-            'start_date': '2025-09-01',  # Same period for comparison
-            'end_date': '2025-10-27'
+            'start_date': '2024-09-01',  # Same period for comparison
+            'end_date': '2025-03-31'
         },
         'options': {
-            'include_real_spread': True,  # SpreadViewer ONLY
+            'include_real_spread': False,  # SpreadViewer ONLY
             'include_synthetic_spread': True,
             'include_individual_legs': True
         },

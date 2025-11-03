@@ -52,7 +52,7 @@ def plot_spread_data(file_path: str):
     return data
 
 def main():
-    file_path = '/mnt/c/Users/krajcovic/Documents/Testing Data/RawData/spreads/debm1_25_frbq2_25_tr_ba_data_data_fetch_engine_method_synthetic.parquet'
+    file_path = '/mnt/c/Users/krajcovic/Documents/Testing Data/RawData/spreads/debm9_25_debm10_25_tr_ba_data_data_fetch_engine_method_real.parquet'
     data = plot_spread_data(file_path)
 
 if __name__ == "__main__":
